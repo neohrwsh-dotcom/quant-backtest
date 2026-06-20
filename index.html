@@ -108,7 +108,6 @@
     }
     @keyframes spin { to { transform: rotate(360deg); } }
 
-    /* 티커별 진행 상태 */
     #ticker-progress { margin-top: 14px; display: flex; flex-direction: column; gap: 6px; }
     .ticker-status {
       display: flex; align-items: center; gap: 8px;
@@ -157,7 +156,6 @@
       margin-top: 8px;
     }
     .hint { font-size: 0.78rem; color: #a0aec0; margin-top: 4px; }
-
     .source-badge {
       display: inline-block;
       padding: 2px 8px;
@@ -188,17 +186,17 @@
   <div class="ticker-row">
     <div class="input-group">
       <label>종목 1</label>
-      <input id="t1" type="text" value="NVDA" placeholder="예: NVDA, AAPL, TQQQ" />
-      <div class="hint">영문 티커 직접 입력 (예: AAPL, TQQQ, QLD)</div>
+      <input id="t1" type="text" value="엔비디아" placeholder="예: 엔비디아, AAPL" />
+      <div class="hint">한글 종목명 또는 영문 티커</div>
     </div>
     <div class="input-group">
       <label>종목 2</label>
-      <input id="t2" type="text" value="QQQ" placeholder="예: QQQ, MSFT" />
-      <div class="hint">한국주식: 005930.KS / 000660.KS</div>
+      <input id="t2" type="text" value="삼성전자" placeholder="예: 삼성전자, 005930" />
+      <div class="hint">한국주식: 이름 또는 6자리 숫자</div>
     </div>
     <div class="input-group">
       <label>종목 3</label>
-      <input id="t3" type="text" value="QLD" placeholder="예: QLD, SPY (비워도 됨)" />
+      <input id="t3" type="text" value="나스닥2배" placeholder="예: 나스닥2배, QLD" />
       <div class="hint">비워두면 2종목만 비교</div>
     </div>
   </div>
@@ -233,14 +231,12 @@
   <div id="error-msg"></div>
 </div>
 
-<!-- 로딩 -->
 <div class="card" id="loading">
   <div class="spinner"></div>
   <div id="loading-text" style="font-size:1.05rem;font-weight:600;">데이터를 불러오는 중...</div>
   <div id="ticker-progress"></div>
 </div>
 
-<!-- 결과 -->
 <div class="card" id="result-card">
   <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
     <div class="section-title" style="margin-bottom:0;">📈 백테스팅 결과</div>
@@ -264,23 +260,45 @@
 
 <script>
 // ════════════════════════════════════════════════════════
-//  설정
+//  종목명 변환 사전 (한글 -> 야후 티커)
+// ════════════════════════════════════════════════════════
+const DICT = {
+  "애플": "AAPL", "마이크로소프트": "MSFT", "마소": "MSFT", "엔비디아": "NVDA", 
+  "알파벳": "GOOGL", "구글": "GOOGL", "아마존": "AMZN", "메타": "META", "페이스북": "META",
+  "테슬라": "TSLA", "브로드컴": "AVGO", "코스트코": "COST", "넷플릭스": "NFLX", 
+  "AMD": "AMD", "암드": "AMD", "펩시": "PEP", "코카콜라": "KO", "시스코": "CSCO", 
+  "어도비": "ADBE", "인텔": "INTC", "퀄컴": "QCOM", "ASML": "ASML", "TSMC": "TSM",
+  "월마트": "WMT", "스타벅스": "SBUX", "디즈니": "DIS", "오라클": "ORCL", "우버": "UBER",
+
+  "나스닥": "QQQ", "나스닥1배": "QQQ", "나스닥2배": "QLD", "나스닥3배": "TQQQ",
+  "S&P500": "SPY", "SPY": "SPY", "VOO": "VOO", "IVV": "IVV", "다우": "DIA",
+  "반도체": "SOXX", "반도체3배": "SOXL", "배당": "SCHD", "러셀2000": "IWM",
+
+  "삼성전자": "005930.KS", "삼전": "005930.KS", "SK하이닉스": "000660.KS", "하이닉스": "000660.KS",
+  "LG에너지솔루션": "373220.KS", "엔솔": "373220.KS", "삼성바이오로직스": "207940.KS", "삼바": "207940.KS",
+  "현대차": "005380.KS", "기아": "000270.KS", "셀트리온": "068270.KS", "POSCO홀딩스": "005490.KS", 
+  "포스코": "005490.KS", "KB금융": "105560.KS", "네이버": "035420.KS", "NAVER": "035420.KS", 
+  "삼성물산": "028260.KS", "삼성SDI": "006400.KS", "신한지주": "055550.KS", "카카오": "035720.KS",
+  "LG화학": "051910.KS", "현대모비스": "012330.KS", "포스코퓨처엠": "003670.KS", "하나금융지주": "086790.KS",
+  "에코프로비엠": "247540.KQ", "에코프로": "086520.KQ"
+};
+
+function getRealTicker(raw) {
+  let clean = raw.trim().replace(/ /g, "").toUpperCase();
+  let ticker = DICT[clean] || clean;
+  if (/^\d{6}$/.test(ticker)) ticker += ".KS"; // 6자리 숫자는 코스피로 인식
+  return ticker;
+}
+
+// ════════════════════════════════════════════════════════
+//  설정 및 유틸
 // ════════════════════════════════════════════════════════
 const DATA_BASE = './data/';
 let currentStrategy = 'lump';
-
-// 세션 내 메모리 캐시 (ticker|from|to → result)
 const CACHE = {};
-
-// 로컬 JSON 존재 여부 캐시 (ticker → true/false)
 const LOCAL_EXISTS = {};
-
-// 종료일 기본값: 오늘
 document.getElementById('to_date').value = new Date().toISOString().slice(0, 10);
 
-// ════════════════════════════════════════════════════════
-//  유틸: AbortController 기반 fetch with timeout
-// ════════════════════════════════════════════════════════
 async function fetchWithTimeout(url, timeoutMs = 8000, options = {}) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -294,20 +312,13 @@ async function fetchWithTimeout(url, timeoutMs = 8000, options = {}) {
   }
 }
 
-// ════════════════════════════════════════════════════════
-//  전략 선택
-// ════════════════════════════════════════════════════════
 function selectStrategy(el) {
   document.querySelectorAll('.radio-label').forEach(l => l.classList.remove('selected'));
   el.classList.add('selected');
   currentStrategy = el.dataset.val;
 }
 
-// ════════════════════════════════════════════════════════
-//  진행 상태 UI
-// ════════════════════════════════════════════════════════
 const statusEls = {};
-
 function initProgress(tickers) {
   const container = document.getElementById('ticker-progress');
   container.innerHTML = '';
@@ -319,7 +330,6 @@ function initProgress(tickers) {
     statusEls[t] = { dot: row.querySelector(`#dot-${t}`), msg: row.querySelector(`#msg-${t}`) };
   });
 }
-
 function setStatus(ticker, state, text) {
   const el = statusEls[ticker];
   if (!el) return;
@@ -328,57 +338,38 @@ function setStatus(ticker, state, text) {
 }
 
 // ════════════════════════════════════════════════════════
-//  1순위: 로컬 JSON (GitHub Pages CDN — 가장 빠름)
+//  데이터 로드 로직 (로컬 JSON -> 야후 API 프록시)
 // ════════════════════════════════════════════════════════
 async function tryLocalJSON(ticker, fromDate, toDate) {
-  // 이미 없다고 확인된 경우 스킵
   if (LOCAL_EXISTS[ticker] === false) return null;
-
   try {
-    // 로컬 JSON은 브라우저 캐시 활용 (당일 재요청 시 즉시 반환)
     const res = await fetchWithTimeout(`${DATA_BASE}${ticker}.json`, 5000, { cache: 'default' });
     if (!res.ok) { LOCAL_EXISTS[ticker] = false; return null; }
-
     const payload = await res.json();
     LOCAL_EXISTS[ticker] = true;
-
     const filtered = payload.data.filter(d => d.date >= fromDate && d.date <= toDate);
-    if (filtered.length < 2) return null; // 날짜 범위 안에 데이터 없음
-
-    return {
-      series: filtered.map(d => ({ date: d.date, close: d.close })),
-      source: 'local',
-      updated: payload.updated,
-    };
+    if (filtered.length < 2) return null;
+    return { series: filtered, source: 'local', updated: payload.updated };
   } catch (e) {
     LOCAL_EXISTS[ticker] = false;
     return null;
   }
 }
 
-// ════════════════════════════════════════════════════════
-//  2순위: Yahoo Finance API — 여러 프록시 동시 경쟁 (가장 빠른 것 사용)
-// ════════════════════════════════════════════════════════
 function buildYahooUrl(ticker, startDate, endDate) {
   const p1 = Math.floor(new Date(startDate).getTime() / 1000);
-  // endDate + 1일 (당일 종가 포함)
   const p2 = Math.floor(new Date(endDate).getTime() / 1000) + 86400;
-  return `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}`
-    + `?interval=1d&period1=${p1}&period2=${p2}&events=div,splits&includeAdjustedClose=true`;
+  return `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1d&period1=${p1}&period2=${p2}&events=div,splits&includeAdjustedClose=true`;
 }
 
 function parseYahooResponse(data) {
   const result = data?.chart?.result?.[0];
   if (!result) throw new Error('결과 없음');
   const timestamps = result.timestamp;
-  const adjClose = result.indicators?.adjclose?.[0]?.adjclose
-                || result.indicators?.quote?.[0]?.close;
+  const adjClose = result.indicators?.adjclose?.[0]?.adjclose || result.indicators?.quote?.[0]?.close;
   if (!timestamps || !adjClose) throw new Error('데이터 필드 없음');
   return timestamps
-    .map((ts, i) => ({
-      date:  new Date(ts * 1000).toISOString().slice(0, 10),
-      close: adjClose[i],
-    }))
+    .map((ts, i) => ({ date: new Date(ts * 1000).toISOString().slice(0, 10), close: adjClose[i] }))
     .filter(d => d.close != null && !isNaN(d.close) && d.close > 0);
 }
 
@@ -389,7 +380,6 @@ async function tryProxy(proxyUrl, timeoutMs) {
   let data;
   try {
     const outer = JSON.parse(text);
-    // allorigins wraps in { contents: "..." }
     data = outer.contents ? JSON.parse(outer.contents) : outer;
   } catch {
     throw new Error('JSON 파싱 실패');
@@ -399,62 +389,50 @@ async function tryProxy(proxyUrl, timeoutMs) {
 
 async function fetchYahooAPI(ticker, startDate, endDate) {
   const yahooUrl = buildYahooUrl(ticker, startDate, endDate);
-
   const PROXIES = [
     `https://api.allorigins.win/get?url=${encodeURIComponent(yahooUrl)}`,
     `https://corsproxy.io/?${encodeURIComponent(yahooUrl)}`,
     `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(yahooUrl)}`,
   ];
-
-  // 모든 프록시를 동시에 시도 → 가장 먼저 성공한 것 사용
   return new Promise((resolve, reject) => {
     let settled = false;
     let failCount = 0;
-
     PROXIES.forEach(proxyUrl => {
       tryProxy(proxyUrl, 10000)
         .then(series => {
-          if (!settled && series.length >= 2) {
-            settled = true;
-            resolve(series);
-          }
+          if (!settled && series.length >= 2) { settled = true; resolve(series); }
         })
         .catch(() => {
           failCount++;
           if (failCount === PROXIES.length && !settled) {
-            reject(new Error(`${ticker}: 모든 데이터 소스 실패 (프록시 ${PROXIES.length}개 모두 응답 없음)`));
+            reject(new Error(`${ticker}: 모든 프록시 서버 응답 실패`));
           }
         });
     });
   });
 }
 
-// ════════════════════════════════════════════════════════
-//  통합 로더: 로컬 우선 → API fallback
-// ════════════════════════════════════════════════════════
 async function loadTicker(ticker, fromDate, toDate) {
   const cacheKey = `${ticker}|${fromDate}|${toDate}`;
   if (CACHE[cacheKey]) {
     setStatus(ticker, 'cached', `캐시에서 즉시 로드 ✅`);
     return CACHE[cacheKey];
   }
-
-  // 1순위: 로컬 JSON
+  
   setStatus(ticker, 'loading', '로컬 데이터 확인 중...');
   const local = await tryLocalJSON(ticker, fromDate, toDate);
   if (local) {
     CACHE[cacheKey] = local;
-    setStatus(ticker, 'ok', `로컬 캐시 로드 완료 ✅ (${local.series.length}일)`);
+    setStatus(ticker, 'ok', `로컬 캐시 로드 완료 ✅`);
     return local;
   }
-
-  // 2순위: Yahoo Finance API (프록시 경쟁)
-  setStatus(ticker, 'loading', '실시간 API 요청 중...');
+  
+  setStatus(ticker, 'loading', '야후 파이낸스 실시간 연결 중...');
   try {
     const series = await fetchYahooAPI(ticker, fromDate, toDate);
     const result = { series, source: 'api', updated: new Date().toISOString().slice(0, 10) };
     CACHE[cacheKey] = result;
-    setStatus(ticker, 'ok', `실시간 로드 완료 ✅ (${series.length}일)`);
+    setStatus(ticker, 'ok', `실시간 로드 완료 ✅`);
     return result;
   } catch (e) {
     setStatus(ticker, 'err', `실패 ❌ — ${e.message}`);
@@ -463,10 +441,10 @@ async function loadTicker(ticker, fromDate, toDate) {
 }
 
 // ════════════════════════════════════════════════════════
-//  백테스팅 계산
+//  백테스트 계산 로직
 // ════════════════════════════════════════════════════════
 function calcLumpSum(series, totalUsd) {
-  const p0     = series[0].close;
+  const p0 = series[0].close;
   const shares = totalUsd / p0;
   return series.map(d => {
     const portfolio = shares * d.close;
@@ -481,7 +459,7 @@ function calcDCA(series, totalUsd) {
   return series.map((d, i) => {
     cumShares += daily / d.close;
     const portfolio = cumShares * d.close;
-    const invested  = daily * (i + 1);
+    const invested = daily * (i + 1);
     return { date: d.date, portfolio, invested, roi: (portfolio / invested - 1) * 100 };
   });
 }
@@ -490,40 +468,38 @@ function calcDCA(series, totalUsd) {
 //  메인 실행
 // ════════════════════════════════════════════════════════
 async function runBacktest() {
-  const tickers = ['t1','t2','t3']
-    .map(id => document.getElementById(id).value.trim().toUpperCase())
+  const rawInputs = ['t1','t2','t3']
+    .map(id => document.getElementById(id).value.trim())
     .filter(t => t !== '');
+    
+  // 입력한 한글/숫자를 변환 사전을 거쳐 실제 티커로 맵핑
+  const targetData = rawInputs.map(raw => ({
+    rawName: raw,
+    ticker: getRealTicker(raw)
+  }));
 
-  const krw      = parseFloat(document.getElementById('krw').value)    || 100_000_000;
-  const fx       = parseFloat(document.getElementById('fx').value)     || 1500;
+  const krw = parseFloat(document.getElementById('krw').value) || 100_000_000;
+  const fx = parseFloat(document.getElementById('fx').value) || 1500;
   const fromDate = document.getElementById('from_date').value;
-  const toDate   = document.getElementById('to_date').value;
+  const toDate = document.getElementById('to_date').value;
   const totalUsd = krw / fx;
 
-  if (tickers.length === 0)
-    return showError('종목을 하나 이상 입력해주세요.');
-  if (!fromDate || !toDate || fromDate >= toDate)
-    return showError('날짜를 올바르게 입력해주세요. (시작일 < 종료일)');
+  if (targetData.length === 0) return showError('종목을 하나 이상 입력해주세요.');
+  if (!fromDate || !toDate || fromDate >= toDate) return showError('시작일이 종료일보다 이전이어야 합니다.');
 
   hideError();
   document.getElementById('ticker-errors').innerHTML = '';
-  initProgress(tickers);
-  showLoading(true, `${tickers.join(', ')} 데이터 로딩 중...`);
+  initProgress(targetData.map(t => t.ticker));
+  showLoading(true, `${targetData.map(t => t.rawName).join(', ')} 데이터를 가져오고 있습니다...`);
   document.getElementById('run-btn').disabled = true;
   document.getElementById('result-card').style.display = 'none';
 
   try {
-    const t0 = performance.now();
-
-    // 모든 티커 병렬 로드 (각 티커는 로컬 → API 자동 fallback)
+    // 맵핑된 실제 영문/한국 티커를 바탕으로 데이터 호출
     const settled = await Promise.allSettled(
-      tickers.map(t => loadTicker(t, fromDate, toDate))
+      targetData.map(t => loadTicker(t.ticker, fromDate, toDate))
     );
 
-    const elapsed = ((performance.now() - t0) / 1000).toFixed(2);
-    console.log(`[완료] 총 ${elapsed}초`);
-
-    // ── 결과 분류 ───────────────────────────────────────
     const failedTickers = [];
     const traces = [];
     const summaryRows = [];
@@ -532,31 +508,31 @@ async function runBacktest() {
     const sourceLabels = [];
 
     settled.forEach((s, i) => {
-      const ticker = tickers[i];
+      const { rawName, ticker } = targetData[i];
 
       if (s.status === 'rejected') {
-        failedTickers.push({ ticker, reason: s.reason?.message || '알 수 없는 오류' });
+        failedTickers.push({ ticker: rawName, reason: s.reason?.message || '알 수 없는 오류' });
         return;
       }
 
       const res = s.value;
       if (!res || res.series.length < 2) {
-        failedTickers.push({ ticker, reason: '유효한 데이터가 없습니다 (날짜 범위 확인)' });
+        failedTickers.push({ ticker: rawName, reason: '해당 기간의 유효한 데이터가 없습니다.' });
         return;
       }
 
       const { series, source, updated } = res;
-      sourceLabels.push({ ticker, source, updated });
+      sourceLabels.push({ ticker: rawName, source, updated });
 
-      const calc      = currentStrategy === 'lump' ? calcLumpSum(series, totalUsd) : calcDCA(series, totalUsd);
-      const dates     = calc.map(r => r.date);
+      const calc = currentStrategy === 'lump' ? calcLumpSum(series, totalUsd) : calcDCA(series, totalUsd);
+      const dates = calc.map(r => r.date);
       const portfolio = calc.map(r => r.portfolio);
-      const invested  = calc.map(r => r.invested);
-      const roi       = calc.map(r => r.roi);
+      const invested = calc.map(r => r.invested);
+      const roi = calc.map(r => r.roi);
 
       if (dates.length > maxLen) {
         maxLen = dates.length;
-        principalDates    = dates;
+        principalDates = dates;
         principalInvested = invested;
       }
 
@@ -569,26 +545,21 @@ async function runBacktest() {
         x: dates, y: portfolio,
         customdata: roi.map((r, j) => [r, invested[j]]),
         mode: 'lines',
-        name: `${ticker}  $${fmt3(finalVal)} (${finalRoi >= 0 ? '+' : ''}${finalRoi.toFixed(1)}%)`,
-        hovertemplate:
-          '<b>%{x}</b><br>평가금: $%{y:,.2f}<br>수익률: %{customdata[0]:,.2f}%<br>투입원금: $%{customdata[1]:,.2f}<extra></extra>',
+        name: `${rawName} $${fmt3(finalVal)} (${finalRoi >= 0 ? '+' : ''}${finalRoi.toFixed(1)}%)`,
+        hovertemplate: '<b>%{x}</b><br>평가금: $%{y:,.2f}<br>수익률: %{customdata[0]:,.2f}%<br>투입원금: $%{customdata[1]:,.2f}<extra></extra>',
         line: { width: 2.5, color: COLORS[i % COLORS.length] }
       });
 
-      summaryRows.push({ ticker, source, updated,
-        startPrice: series[0].close,
-        endPrice:   series.at(-1).close,
-        days: series.length, finalVal, finalInv, finalRoi });
+      summaryRows.push({ 
+        ticker: rawName, source, updated,
+        startPrice: series[0].close, endPrice: series.at(-1).close,
+        days: series.length, finalVal, finalInv, finalRoi 
+      });
     });
 
-    // 실패 티커 표시 (결과 카드에 경고로)
     const errBox = document.getElementById('ticker-errors');
-    errBox.innerHTML = failedTickers.map(f =>
-      `<div class="ticker-error">⚠️ <b>${f.ticker}</b>: ${f.reason}</div>`
-    ).join('');
-
-    if (traces.length === 0)
-      throw new Error('유효한 데이터가 없습니다. 종목 코드와 날짜 범위를 확인하세요.');
+    errBox.innerHTML = failedTickers.map(f => `<div class="ticker-error">⚠️ <b>${f.ticker}</b>: ${f.reason}</div>`).join('');
+    if (traces.length === 0) throw new Error('그릴 수 있는 유효한 데이터가 없습니다.');
 
     if (principalDates) {
       traces.push({
@@ -602,33 +573,27 @@ async function runBacktest() {
     const stratLabel = currentStrategy === 'lump' ? '거치식' : '적립식';
     Plotly.newPlot('chart', traces, {
       title: {
-        text: `<b>${fromDate} ~ ${toDate}  ${stratLabel} 백테스팅</b><br>`
+        text: `<b>${fromDate} ~ ${toDate} ${stratLabel} 백테스팅</b><br>`
             + `<span style="font-size:13px;color:#718096;">총 원금: ₩${krw.toLocaleString()}`
-            + `  (환율 ${fx}원 기준 → $${Math.round(totalUsd).toLocaleString()})</span>`,
+            + ` (환율 ${fx}원 기준 → $${Math.round(totalUsd).toLocaleString()})</span>`,
         font: { size: 17 }
       },
       xaxis: { title: '날짜', showgrid: true, gridcolor: '#f0f4f8' },
       yaxis: { title: '평가금액 (USD $)', showgrid: true, gridcolor: '#f0f4f8' },
       hovermode: 'x unified',
       template: 'plotly_white',
-      legend: { yanchor:'top', y:0.99, xanchor:'left', x:0.01,
-                bgcolor:'rgba(255,255,255,0.85)', bordercolor:'#e2e8f0', borderwidth:1 },
+      legend: { yanchor:'top', y:0.99, xanchor:'left', x:0.01, bgcolor:'rgba(255,255,255,0.85)', bordercolor:'#e2e8f0', borderwidth:1 },
       margin: { t:100, b:60, l:70, r:40 },
       paper_bgcolor: 'white', plot_bgcolor: 'white',
     }, { responsive: true, displayModeBar: true });
 
-    // 데이터 소스 정보
-    document.getElementById('data-source-info').innerHTML =
-      sourceLabels.map(s =>
-        `${s.ticker}: <span class="source-badge ${s.source === 'local' ? 'badge-local' : 'badge-api'}">`
-        + `${s.source === 'local' ? '📦 사전캐시' : '🌐 실시간'}</span>`
-        + (s.updated ? ` <span style="color:#a0aec0;font-size:0.78rem;">${s.updated}</span>` : '')
-      ).join('　');
+    document.getElementById('data-source-info').innerHTML = sourceLabels.map(s =>
+      `${s.ticker}: <span class="source-badge ${s.source === 'local' ? 'badge-local' : 'badge-api'}">${s.source === 'local' ? '📦 사전캐시' : '🌐 실시간'}</span>`
+    ).join(' ');
 
-    // 요약 테이블
     const tbody = document.getElementById('summary-body');
     tbody.innerHTML = summaryRows.map(row => {
-      const cls  = row.finalRoi >= 0 ? 'positive' : 'negative';
+      const cls = row.finalRoi >= 0 ? 'positive' : 'negative';
       const sign = row.finalRoi >= 0 ? '+' : '';
       return `<tr>
         <td><b>${row.ticker}</b></td>
@@ -645,7 +610,7 @@ async function runBacktest() {
     document.getElementById('result-card').style.display = 'block';
 
   } catch (e) {
-    showError(`오류 발생: ${e.message}`);
+    showError(e.message);
   } finally {
     showLoading(false);
     document.getElementById('run-btn').disabled = false;
@@ -661,13 +626,8 @@ function showError(msg) {
   el.style.display = 'block';
   el.textContent = '⚠️ ' + msg;
 }
-function hideError() {
-  document.getElementById('error-msg').style.display = 'none';
-}
-
-document.addEventListener('keydown', e => {
-  if (e.key === 'Enter' && !document.getElementById('run-btn').disabled) runBacktest();
-});
+function hideError() { document.getElementById('error-msg').style.display = 'none'; }
+document.addEventListener('keydown', e => { if (e.key === 'Enter' && !document.getElementById('run-btn').disabled) runBacktest(); });
 </script>
 </body>
 </html>
