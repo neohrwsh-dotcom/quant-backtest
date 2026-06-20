@@ -1,0 +1,571 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>📊 퀀트 백테스팅 대시보드</title>
+
+  <!-- Plotly.js (차트) -->
+  <script src="https://cdn.jsdelivr.net/npm/plotly.js-dist@2.35.2/plotly.min.js"></script>
+
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Segoe UI', 'Apple SD Gothic Neo', sans-serif;
+      background: #f0f4f8;
+      color: #1a202c;
+      min-height: 100vh;
+    }
+
+    header {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+      padding: 24px 32px;
+      box-shadow: 0 4px 12px rgba(102,126,234,0.4);
+    }
+    header h1 { font-size: 1.8rem; font-weight: 700; }
+    header p  { font-size: 0.95rem; opacity: 0.85; margin-top: 4px; }
+
+    .card {
+      background: white;
+      border-radius: 16px;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+      padding: 28px 32px;
+      margin: 24px auto;
+      max-width: 1100px;
+    }
+
+    .section-title {
+      font-size: 1rem;
+      font-weight: 700;
+      color: #4a5568;
+      margin-bottom: 14px;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+    }
+
+    /* 종목 입력 */
+    .ticker-row {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 16px;
+      margin-bottom: 20px;
+    }
+    .input-group {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .input-group label {
+      font-size: 0.85rem;
+      font-weight: 600;
+      color: #718096;
+    }
+    .input-group input, .input-group select {
+      padding: 10px 14px;
+      border: 1.5px solid #e2e8f0;
+      border-radius: 10px;
+      font-size: 1rem;
+      transition: border-color 0.2s;
+      outline: none;
+    }
+    .input-group input:focus, .input-group select:focus {
+      border-color: #667eea;
+      box-shadow: 0 0 0 3px rgba(102,126,234,0.15);
+    }
+
+    /* 설정 행 */
+    .settings-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr 1fr;
+      gap: 16px;
+      margin-bottom: 20px;
+    }
+
+    /* 라디오 버튼 */
+    .radio-group {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .radio-group label {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 8px 16px;
+      border: 1.5px solid #e2e8f0;
+      border-radius: 20px;
+      cursor: pointer;
+      font-size: 0.9rem;
+      font-weight: 500;
+      transition: all 0.2s;
+      user-select: none;
+    }
+    .radio-group input[type=radio] { display: none; }
+    .radio-group input[type=radio]:checked + span {
+      /* handled via JS */
+    }
+    .radio-label.selected {
+      background: #667eea;
+      border-color: #667eea;
+      color: white;
+    }
+
+    /* 실행 버튼 */
+    .run-btn {
+      width: 100%;
+      padding: 14px;
+      background: linear-gradient(135deg, #667eea, #764ba2);
+      color: white;
+      border: none;
+      border-radius: 12px;
+      font-size: 1.1rem;
+      font-weight: 700;
+      cursor: pointer;
+      transition: opacity 0.2s, transform 0.1s;
+      letter-spacing: 0.02em;
+    }
+    .run-btn:hover  { opacity: 0.92; transform: translateY(-1px); }
+    .run-btn:active { opacity: 0.85; transform: translateY(0); }
+    .run-btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+
+    /* 로딩 */
+    #loading {
+      display: none;
+      text-align: center;
+      padding: 40px;
+      color: #667eea;
+      font-size: 1.05rem;
+    }
+    .spinner {
+      display: inline-block;
+      width: 36px; height: 36px;
+      border: 4px solid #e2e8f0;
+      border-top-color: #667eea;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      margin-bottom: 12px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* 결과 */
+    #result-card { display: none; }
+    #chart { width: 100%; height: 520px; }
+
+    /* 요약 테이블 */
+    .summary-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.95rem;
+      margin-top: 8px;
+    }
+    .summary-table th {
+      background: #f7fafc;
+      color: #4a5568;
+      font-weight: 700;
+      padding: 10px 14px;
+      text-align: left;
+      border-bottom: 2px solid #e2e8f0;
+    }
+    .summary-table td {
+      padding: 10px 14px;
+      border-bottom: 1px solid #f0f4f8;
+    }
+    .summary-table tr:hover td { background: #f7fafc; }
+    .positive { color: #e53e3e; font-weight: 700; }
+    .negative { color: #3182ce; font-weight: 700; }
+
+    /* 에러 */
+    #error-msg {
+      display: none;
+      background: #fff5f5;
+      border: 1.5px solid #fc8181;
+      border-radius: 10px;
+      padding: 14px 18px;
+      color: #c53030;
+      font-size: 0.95rem;
+      margin-top: 16px;
+    }
+
+    /* 한글 종목명 힌트 */
+    .hint {
+      font-size: 0.78rem;
+      color: #a0aec0;
+      margin-top: 4px;
+    }
+
+    @media (max-width: 700px) {
+      .ticker-row { grid-template-columns: 1fr; }
+      .settings-row { grid-template-columns: 1fr 1fr; }
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>📊 퀀트 백테스팅 대시보드</h1>
+  <p>GitHub Pages 기반 · 서버 불필요 · 실시간 Yahoo Finance 데이터</p>
+</header>
+
+<!-- 입력 카드 -->
+<div class="card">
+  <div class="section-title">🔍 종목 입력</div>
+  <div class="ticker-row">
+    <div class="input-group">
+      <label>종목 1</label>
+      <input id="t1" type="text" value="NVDA" placeholder="예: NVDA, QQQ, 005930.KS" />
+      <div class="hint">영문 티커 직접 입력 (예: AAPL, TQQQ, QLD)</div>
+    </div>
+    <div class="input-group">
+      <label>종목 2</label>
+      <input id="t2" type="text" value="QQQ" placeholder="예: MSFT, TQQQ" />
+      <div class="hint">한국주식: 005930.KS / 000660.KS</div>
+    </div>
+    <div class="input-group">
+      <label>종목 3</label>
+      <input id="t3" type="text" value="QLD" placeholder="예: QLD, SPY (비워도 됨)" />
+      <div class="hint">비워두면 2종목만 비교</div>
+    </div>
+  </div>
+
+  <div class="section-title">⚙️ 투자 설정</div>
+  <div class="settings-row">
+    <div class="input-group">
+      <label>총 투자금액 (원화 ₩)</label>
+      <input id="krw" type="number" value="100000000" step="1000000" min="1000000" />
+    </div>
+    <div class="input-group">
+      <label>시작일</label>
+      <input id="from_date" type="date" value="2015-01-01" />
+    </div>
+    <div class="input-group">
+      <label>종료일</label>
+      <input id="to_date" type="date" />
+    </div>
+    <div class="input-group">
+      <label>환율 (KRW/USD)</label>
+      <input id="fx" type="number" value="1500" step="10" min="500" max="3000" />
+    </div>
+  </div>
+
+  <div class="section-title" style="margin-bottom:10px;">💼 투자 방식</div>
+  <div class="radio-group" id="strategy-group" style="margin-bottom:20px;">
+    <label class="radio-label selected" data-val="lump" onclick="selectStrategy(this)">
+      거치식 (첫날 전액 투자)
+    </label>
+    <label class="radio-label" data-val="dca" onclick="selectStrategy(this)">
+      적립식 (매일 분할 투자)
+    </label>
+  </div>
+
+  <button class="run-btn" id="run-btn" onclick="runBacktest()">🚀 백테스팅 실행</button>
+  <div id="error-msg"></div>
+</div>
+
+<!-- 로딩 -->
+<div class="card" id="loading">
+  <div class="spinner"></div>
+  <div id="loading-text">데이터를 불러오는 중입니다...</div>
+</div>
+
+<!-- 결과 카드 -->
+<div class="card" id="result-card">
+  <div class="section-title">📈 백테스팅 결과</div>
+  <div id="chart"></div>
+  <div style="margin-top:24px;">
+    <div class="section-title">📋 종목별 요약</div>
+    <table class="summary-table" id="summary-table">
+      <thead>
+        <tr>
+          <th>종목</th>
+          <th>시작가</th>
+          <th>최종가</th>
+          <th>기간</th>
+          <th>최종 평가금 ($)</th>
+          <th>투입 원금 ($)</th>
+          <th>수익률</th>
+        </tr>
+      </thead>
+      <tbody id="summary-body"></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+// ─────────────────────────────────────────────
+// 전역 상태
+// ─────────────────────────────────────────────
+let currentStrategy = 'lump';
+const CACHE = {};  // { "TICKER|start|end": [ {date, close}, ... ] }
+
+// 종료일 기본값: 오늘
+document.getElementById('to_date').value = new Date().toISOString().slice(0,10);
+
+// ─────────────────────────────────────────────
+// 전략 선택
+// ─────────────────────────────────────────────
+function selectStrategy(el) {
+  document.querySelectorAll('.radio-label').forEach(l => l.classList.remove('selected'));
+  el.classList.add('selected');
+  currentStrategy = el.dataset.val;
+}
+
+// ─────────────────────────────────────────────
+// Yahoo Finance 데이터 fetch
+// 공식 v8 API (CORS 우회: allorigins 프록시 사용)
+// ─────────────────────────────────────────────
+async function fetchYahoo(ticker, startDate, endDate) {
+  const cacheKey = `${ticker}|${startDate}|${endDate}`;
+  if (CACHE[cacheKey]) {
+    console.log(`[캐시 HIT] ${ticker}`);
+    return CACHE[cacheKey];
+  }
+
+  const start = Math.floor(new Date(startDate).getTime() / 1000);
+  const end   = Math.floor(new Date(endDate).getTime()   / 1000);
+
+  // Yahoo Finance v8 API URL
+  const yahooUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1d&period1=${start}&period2=${end}&events=div,splits&includeAdjustedClose=true`;
+
+  // allorigins.win 프록시로 CORS 우회
+  const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(yahooUrl)}`;
+
+  const resp = await fetch(proxyUrl, { timeout: 20000 });
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+
+  const outer = await resp.json();
+  const data  = JSON.parse(outer.contents);
+
+  const result = data?.chart?.result?.[0];
+  if (!result) throw new Error(`${ticker}: 데이터 없음`);
+
+  const timestamps  = result.timestamp;
+  const adjClose    = result.indicators?.adjclose?.[0]?.adjclose
+                   || result.indicators?.quote?.[0]?.close;
+
+  if (!timestamps || !adjClose) throw new Error(`${ticker}: 가격 데이터 없음`);
+
+  const series = timestamps.map((ts, i) => ({
+    date:  new Date(ts * 1000).toISOString().slice(0, 10),
+    close: adjClose[i]
+  })).filter(d => d.close !== null && d.close !== undefined && !isNaN(d.close));
+
+  CACHE[cacheKey] = series;
+  return series;
+}
+
+// ─────────────────────────────────────────────
+// 백테스팅 계산
+// ─────────────────────────────────────────────
+function calcLumpSum(series, totalUsd) {
+  const p0 = series[0].close;
+  const shares = totalUsd / p0;
+  return series.map((d, i) => {
+    const portfolio = shares * d.close;
+    const roi = (portfolio / totalUsd - 1) * 100;
+    return { date: d.date, portfolio, invested: totalUsd, roi };
+  });
+}
+
+function calcDCA(series, totalUsd) {
+  const n = series.length;
+  const daily = totalUsd / n;
+  let cumShares = 0;
+  return series.map((d, i) => {
+    cumShares += daily / d.close;
+    const portfolio = cumShares * d.close;
+    const invested  = daily * (i + 1);
+    const roi = (portfolio / invested - 1) * 100;
+    return { date: d.date, portfolio, invested, roi };
+  });
+}
+
+// ─────────────────────────────────────────────
+// 메인 실행
+// ─────────────────────────────────────────────
+async function runBacktest() {
+  const tickers = [
+    document.getElementById('t1').value.trim().toUpperCase(),
+    document.getElementById('t2').value.trim().toUpperCase(),
+    document.getElementById('t3').value.trim().toUpperCase(),
+  ].filter(t => t !== '');
+
+  const krw       = parseFloat(document.getElementById('krw').value) || 100000000;
+  const fx        = parseFloat(document.getElementById('fx').value)  || 1500;
+  const fromDate  = document.getElementById('from_date').value;
+  const toDate    = document.getElementById('to_date').value;
+  const totalUsd  = krw / fx;
+
+  // 입력 검증
+  if (tickers.length === 0) {
+    showError('종목을 하나 이상 입력해주세요.');
+    return;
+  }
+  if (!fromDate || !toDate || fromDate >= toDate) {
+    showError('날짜를 올바르게 입력해주세요. (시작일 < 종료일)');
+    return;
+  }
+
+  hideError();
+  showLoading(true);
+  document.getElementById('run-btn').disabled = true;
+  document.getElementById('result-card').style.display = 'none';
+
+  try {
+    // 병렬 fetch (Promise.all)
+    document.getElementById('loading-text').textContent =
+      `${tickers.join(', ')} 데이터를 병렬로 불러오는 중...`;
+
+    const allSeries = await Promise.all(
+      tickers.map(t => fetchYahoo(t, fromDate, toDate).catch(e => {
+        console.warn(`${t} 오류: ${e.message}`);
+        return null;
+      }))
+    );
+
+    // 차트 데이터 구성
+    const traces = [];
+    const summaryRows = [];
+    let principalDates    = null;
+    let principalInvested = null;
+    let maxLen = 0;
+
+    const COLORS = ['#667eea', '#f6ad55', '#68d391', '#fc8181', '#76e4f7'];
+
+    allSeries.forEach((series, idx) => {
+      const ticker = tickers[idx];
+      if (!series || series.length < 2) {
+        console.warn(`${ticker}: 유효 데이터 없음`);
+        return;
+      }
+
+      const result = currentStrategy === 'lump'
+        ? calcLumpSum(series, totalUsd)
+        : calcDCA(series, totalUsd);
+
+      const dates     = result.map(r => r.date);
+      const portfolio = result.map(r => r.portfolio);
+      const invested  = result.map(r => r.invested);
+      const roi       = result.map(r => r.roi);
+
+      if (dates.length > maxLen) {
+        maxLen = dates.length;
+        principalDates    = dates;
+        principalInvested = invested;
+      }
+
+      const finalRoi = roi[roi.length - 1];
+      const finalVal = portfolio[portfolio.length - 1];
+      const finalInv = invested[invested.length - 1];
+
+      traces.push({
+        x: dates,
+        y: portfolio,
+        customdata: roi.map((r, i) => [r, invested[i]]),
+        mode: 'lines',
+        name: `${ticker}  $${finalVal.toFixed(0).replace(/\B(?=(\d{3})+(?!\d))/g,',')} (${finalRoi >= 0 ? '+' : ''}${finalRoi.toFixed(1)}%)`,
+        hovertemplate:
+          '<b>%{x}</b><br>' +
+          '평가금: $%{y:,.2f}<br>' +
+          '수익률: %{customdata[0]:,.2f}%<br>' +
+          '투입원금: $%{customdata[1]:,.2f}' +
+          '<extra></extra>',
+        line: { width: 2.5, color: COLORS[idx % COLORS.length] }
+      });
+
+      summaryRows.push({
+        ticker,
+        startPrice: series[0].close.toFixed(2),
+        endPrice:   series[series.length-1].close.toFixed(2),
+        days:       series.length,
+        finalVal,
+        finalInv,
+        finalRoi
+      });
+    });
+
+    if (traces.length === 0) {
+      throw new Error('유효한 데이터가 없습니다. 종목 코드를 확인하세요.');
+    }
+
+    // 원금 기준선
+    if (principalDates) {
+      traces.push({
+        x: principalDates,
+        y: principalInvested,
+        mode: 'lines',
+        name: '투입 원금 (Principal)',
+        hovertemplate: '<b>%{x}</b><br>누적 원금: $%{y:,.2f}<extra></extra>',
+        line: { color: '#a0aec0', width: 1.8, dash: 'dash' }
+      });
+    }
+
+    // Plotly 차트
+    const stratLabel = currentStrategy === 'lump' ? '거치식' : '적립식';
+    Plotly.newPlot('chart', traces, {
+      title: {
+        text: `<b>${fromDate} ~ ${toDate}  ${stratLabel} 백테스팅</b><br>` +
+              `<span style="font-size:13px;color:#718096;">` +
+              `총 원금: ₩${krw.toLocaleString()}  (환율 ${fx}원 기준 → $${totalUsd.toLocaleString(undefined,{maximumFractionDigits:0})})</span>`,
+        font: { size: 17 }
+      },
+      xaxis: { title: '날짜', showgrid: true, gridcolor: '#f0f4f8' },
+      yaxis: { title: '평가금액 (USD $)', showgrid: true, gridcolor: '#f0f4f8' },
+      hovermode: 'x unified',
+      template: 'plotly_white',
+      legend: { yanchor:'top', y:0.99, xanchor:'left', x:0.01,
+                bgcolor:'rgba(255,255,255,0.85)', bordercolor:'#e2e8f0', borderwidth:1 },
+      margin: { t: 100, b: 60, l: 70, r: 40 },
+      paper_bgcolor: 'white',
+      plot_bgcolor:  'white',
+    }, { responsive: true, displayModeBar: true });
+
+    // 요약 테이블
+    const tbody = document.getElementById('summary-body');
+    tbody.innerHTML = '';
+    summaryRows.forEach(row => {
+      const roiClass = row.finalRoi >= 0 ? 'positive' : 'negative';
+      const roiSign  = row.finalRoi >= 0 ? '+' : '';
+      tbody.innerHTML += `
+        <tr>
+          <td><b>${row.ticker}</b></td>
+          <td>$${parseFloat(row.startPrice).toLocaleString(undefined,{maximumFractionDigits:2})}</td>
+          <td>$${parseFloat(row.endPrice).toLocaleString(undefined,{maximumFractionDigits:2})}</td>
+          <td>${row.days}일</td>
+          <td>$${row.finalVal.toLocaleString(undefined,{maximumFractionDigits:0})}</td>
+          <td>$${row.finalInv.toLocaleString(undefined,{maximumFractionDigits:0})}</td>
+          <td class="${roiClass}">${roiSign}${row.finalRoi.toFixed(2)}%</td>
+        </tr>`;
+    });
+
+    document.getElementById('result-card').style.display = 'block';
+
+  } catch(e) {
+    showError(`오류 발생: ${e.message}`);
+  } finally {
+    showLoading(false);
+    document.getElementById('run-btn').disabled = false;
+  }
+}
+
+function showLoading(on) {
+  document.getElementById('loading').style.display = on ? 'block' : 'none';
+}
+function showError(msg) {
+  const el = document.getElementById('error-msg');
+  el.style.display = 'block';
+  el.textContent   = '⚠️ ' + msg;
+}
+function hideError() {
+  document.getElementById('error-msg').style.display = 'none';
+}
+
+// Enter 키로 실행
+document.addEventListener('keydown', e => {
+  if (e.key === 'Enter') runBacktest();
+});
+</script>
+
+</body>
+</html>
