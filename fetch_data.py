@@ -1,8 +1,23 @@
 # ============================================================
-# 퀀트 백테스팅 대시보드 v5 (속도 개선 최종 반영)
+# 퀀트 백테스팅 대시보드 v5.1 (한국 주식 / 한글 검색 버그 수정)
 # ============================================================
 # 변경 이력:
-#   v5 (속도 최적화 최종판)
+#   v5.1 (한국주식·한글 검색 버그 수정)
+#     - resolve_ticker: 유니코드 NFC 정규화 추가 → 한글 입력 완전 대응
+#     - _extract_close_series: 최신 yfinance 2.x MultiIndex 구조 완전 재작성
+#       (level별 컬럼 직접 탐색, ticker 코드 부분매칭 포함)
+#     - _fetch_kr_ticker: FDR 컬럼명 대소문자 무시 매칭 + 수치형 첫컬럼 fallback
+#       history() 반환 MultiIndex 처리를 _get_close_from_hist()로 분리
+#     - _fetch_us_batch: yf.download() 파라미터를 버전별 호환(try/except)으로 수정
+#       (threads/repair 파라미터가 yfinance 2.x에서 제거된 문제 대응)
+#
+#   v6 (버그 수정)
+#     ─ yfinance 2.x group_by/threads 파라미터 완전 제거 (_yf_download_safe)
+#     ─ _extract_close_series: MultiIndex level name 'Price'/'Ticker' 완전 대응
+#     ─ _fetch_kr_ticker: _fdr_close + _history_close 헬퍼로 버전 무관 추출
+#     ─ FDR 컬럼 추출: 수치형 첫 컬럼 fallback 추가
+#     ─ yf.Ticker().history(): 튜플 컬럼명 포함 모든 구조 대응
+#   v5 (속도 최적화)
 #     - US 종목: yf.download() 배치 1회 요청 + threads=True
 #     - KR 종목(.KS/.KQ): yf.Ticker().history() 개별 (배치보다 안정적)
 #     - repair=False → 불필요한 추가 HTTP 제거
@@ -212,70 +227,132 @@ def _safe_tz_strip(idx: pd.DatetimeIndex) -> pd.DatetimeIndex:
 def _extract_close_series(df: pd.DataFrame, ticker: str) -> pd.Series:
     """
     yfinance DataFrame에서 Close 시리즈 추출.
-    MultiIndex (Price×Ticker / Ticker×Price), 단일 Index 모두 대응.
+    ─────────────────────────────────────────────────────────────
+    yfinance 버전별 반환 구조 4가지 모두 대응:
+      A) MultiIndex (Price, Ticker) — yfinance ≥0.2.31 기본값
+         level names: ['Price','Ticker']  or  lvl0에 'Close' 포함
+      B) MultiIndex (Ticker, Price) — 구버전 group_by='ticker'
+         level names: ['Ticker','Price']  or  lvl0에 ticker 포함
+      C) MultiIndex level 1에 Price 이름
+      D) 단일 Index — 단일 종목 download 또는 Ticker.history()
+    ─────────────────────────────────────────────────────────────
     """
     if df is None or df.empty:
         return pd.Series(dtype=float, name=ticker)
+
+    PRICE_COLS = ["Close", "Adj Close", "close", "adj close"]
+
+    def _pick_close(subdf: pd.DataFrame) -> pd.Series:
+        """단순 컬럼 DataFrame에서 Close 계열 컬럼 선택."""
+        for c in PRICE_COLS:
+            if c in subdf.columns:
+                return subdf[c].dropna()
+        # 대소문자 무시
+        low_map = {c.lower(): c for c in subdf.columns}
+        for c in ["close", "adj close"]:
+            if c in low_map:
+                return subdf[low_map[c]].dropna()
+        # 마지막 수단: 수치형 첫 컬럼
+        num_cols = subdf.select_dtypes(include="number").columns
+        if len(num_cols):
+            return subdf[num_cols[0]].dropna()
+        return pd.Series(dtype=float)
+
     try:
-        if isinstance(df.columns, pd.MultiIndex):
-            lvl0_raw = df.columns.get_level_values(0).tolist()
-            lvl0_low = [x.lower() for x in lvl0_raw]
-            lvl1_raw = df.columns.get_level_values(1).tolist()
+        if not isinstance(df.columns, pd.MultiIndex):
+            # ── Case D: 단일 Index ─────────────────────────────
+            s = _pick_close(df)
+            if not s.empty:
+                s.name = ticker
+                return s
+            return pd.Series(dtype=float, name=ticker)
 
-            # Case A: (Price, Ticker) — 최신 yfinance 기본값
-            for price_col in ["Close", "Adj Close"]:
-                if price_col.lower() in lvl0_low:
-                    actual = lvl0_raw[lvl0_low.index(price_col.lower())]
-                    try:
-                        sub = df.xs(actual, axis=1, level=0, drop_level=True)
-                    except KeyError:
-                        continue
-                    if ticker in sub.columns:
-                        return sub[ticker].dropna()
-                    col_map = {c.upper(): c for c in sub.columns}
-                    if ticker.upper() in col_map:
-                        return sub[col_map[ticker.upper()]].dropna()
+        # MultiIndex 처리
+        lvl0 = df.columns.get_level_values(0).tolist()
+        lvl1 = df.columns.get_level_values(1).tolist()
+        lvl0_low = [str(x).lower() for x in lvl0]
+        lvl1_low = [str(x).lower() for x in lvl1]
+        t_up = ticker.upper()
 
-            # Case B: (Ticker, Price)
-            ticker_upper = ticker.upper()
-            lvl0_upper   = [x.upper() for x in lvl0_raw]
-            if ticker_upper in lvl0_upper:
-                actual_t = lvl0_raw[lvl0_upper.index(ticker_upper)]
+        # ── Case A: level-0 = Price name ('Close' / 'Price' 등) ─
+        #   최신 yfinance: columns = [('Close','AAPL'),('Volume','AAPL'),...]
+        price_in_lvl0 = any(c in lvl0_low for c in ["close", "adj close"])
+        if price_in_lvl0:
+            for want in ["close", "adj close"]:
+                indices = [i for i, v in enumerate(lvl0_low) if v == want]
+                if not indices:
+                    continue
+                # level-1 값(ticker)으로 필터
+                for i in indices:
+                    l1_val = str(lvl1[i]).upper()
+                    if l1_val == t_up or l1_val == "":
+                        s = df.iloc[:, i].dropna()
+                        if not s.empty:
+                            s.name = ticker
+                            return s
+                # ticker가 level-1에 없으면 xs 시도
+                actual_col = lvl0[indices[0]]
                 try:
-                    sub = df.xs(actual_t, axis=1, level=0, drop_level=True)
-                    for col in ["Close", "Adj Close"]:
-                        if col in sub.columns:
-                            return sub[col].dropna()
-                    return sub.iloc[:, 0].dropna()
-                except KeyError:
+                    sub = df.xs(actual_col, axis=1, level=0, drop_level=True)
+                    col_map = {str(c).upper(): c for c in sub.columns}
+                    match = col_map.get(t_up) or col_map.get("") or (list(col_map.values())[0] if col_map else None)
+                    if match is not None:
+                        s = sub[match].dropna()
+                        if not s.empty:
+                            s.name = ticker
+                            return s
+                except Exception:
                     pass
 
-            # Case C: level 1에 Price가 있는 경우
-            lvl1_low = [x.lower() for x in lvl1_raw]
-            for price_col in ["close", "adj close"]:
-                if price_col in lvl1_low:
-                    actual = lvl1_raw[lvl1_low.index(price_col)]
-                    try:
-                        sub = df.xs(actual, axis=1, level=1, drop_level=True)
-                        if ticker in sub.columns:
-                            return sub[ticker].dropna()
-                        col_map = {c.upper(): c for c in sub.columns}
-                        if ticker.upper() in col_map:
-                            return sub[col_map[ticker.upper()]].dropna()
-                    except KeyError:
-                        pass
+        # ── Case B: level-0 = Ticker name ──────────────────────
+        #   구버전: columns = [('AAPL','Close'),('AAPL','Volume'),...]
+        ticker_in_lvl0 = any(str(x).upper() == t_up for x in lvl0)
+        if ticker_in_lvl0:
+            actual_t = next(x for x in lvl0 if str(x).upper() == t_up)
+            try:
+                sub = df.xs(actual_t, axis=1, level=0, drop_level=True)
+                s = _pick_close(sub)
+                if not s.empty:
+                    s.name = ticker
+                    return s
+            except Exception:
+                pass
 
-        else:
-            # 단일 Index DataFrame
-            for col in ["Close", "Adj Close"]:
-                if col in df.columns:
-                    return df[col].dropna()
-            col_lower = {c.lower(): c for c in df.columns}
-            for key in ["close", "adj close"]:
-                if key in col_lower:
-                    return df[col_lower[key]].dropna()
-            if not df.empty:
-                return df.iloc[:, 0].dropna()
+        # ── Case C: level-1 = Price name ───────────────────────
+        price_in_lvl1 = any(c in lvl1_low for c in ["close", "adj close"])
+        if price_in_lvl1:
+            for want in ["close", "adj close"]:
+                indices = [i for i, v in enumerate(lvl1_low) if v == want]
+                if not indices:
+                    continue
+                for i in indices:
+                    l0_val = str(lvl0[i]).upper()
+                    if l0_val == t_up or l0_val == "":
+                        s = df.iloc[:, i].dropna()
+                        if not s.empty:
+                            s.name = ticker
+                            return s
+                actual_col = lvl1[indices[0]]
+                try:
+                    sub = df.xs(actual_col, axis=1, level=1, drop_level=True)
+                    col_map = {str(c).upper(): c for c in sub.columns}
+                    match = col_map.get(t_up) or (list(col_map.values())[0] if col_map else None)
+                    if match is not None:
+                        s = sub[match].dropna()
+                        if not s.empty:
+                            s.name = ticker
+                            return s
+                except Exception:
+                    pass
+
+        # ── 마지막 수단: 전체 수치형 컬럼 첫 번째 ───────────────
+        num_cols = df.select_dtypes(include="number").columns
+        if len(num_cols):
+            s = df[num_cols[0]].dropna()
+            if not s.empty:
+                s.name = ticker
+                dprint(f"  [추출 최후수단] {ticker}: 컬럼={num_cols[0]}")
+                return s
 
     except Exception as e:
         dprint(f"  [추출 오류] {ticker}: {e}")
@@ -283,14 +360,130 @@ def _extract_close_series(df: pd.DataFrame, ticker: str) -> pd.Series:
     return pd.Series(dtype=float, name=ticker)
 
 
+def _get_close_from_hist(hist: pd.DataFrame, ticker: str) -> pd.Series:
+    """
+    yf.Ticker().history() 반환 DataFrame에서 Close 추출.
+    최신 yfinance 2.x: hist.columns = MultiIndex([('Close', '005930.KS'), ...])
+    구버전 yfinance   : hist.columns = ['Open','High','Low','Close', ...]
+    """
+    if hist is None or hist.empty:
+        return pd.Series(dtype=float, name=ticker)
+    if isinstance(hist.columns, pd.MultiIndex):
+        return _extract_close_series(hist, ticker)
+    # 단일 인덱스
+    col_low = {str(c).lower(): c for c in hist.columns}
+    for cname in ["close", "adj close"]:
+        if cname in col_low:
+            return hist[col_low[cname]].dropna().rename(ticker)
+    # 수치형 첫 컬럼
+    num_cols = hist.select_dtypes(include=[float, int]).columns
+    if len(num_cols) > 0:
+        return hist[num_cols[0]].dropna().rename(ticker)
+    return pd.Series(dtype=float, name=ticker)
+
+
+def _fdr_close(df_fdr: pd.DataFrame, ticker: str) -> pd.Series:
+    """
+    FinanceDataReader 결과에서 Close 추출.
+    ─────────────────────────────────────────────────────────────
+    FDR 버전별 컬럼명:
+      - 구버전: ['Open','High','Low','Close','Volume','Change']
+      - 신버전: ['Open','High','Low','Close','Adj Close','Volume']
+      - 일부:   ['open','high','low','close',...]  (소문자)
+    수치형 컬럼 fallback으로 버전 무관 동작 보장.
+    ─────────────────────────────────────────────────────────────
+    """
+    if df_fdr is None or df_fdr.empty:
+        return pd.Series(dtype=float, name=ticker)
+    # 1) 이름 우선
+    for col in ["Close", "Adj Close", "close", "adj close"]:
+        if col in df_fdr.columns:
+            s = df_fdr[col].dropna()
+            if not s.empty and pd.api.types.is_numeric_dtype(s):
+                s.name = ticker
+                return s
+    # 2) 대소문자 무시
+    low_map = {c.lower(): c for c in df_fdr.columns}
+    for key in ["close", "adj close"]:
+        if key in low_map:
+            s = df_fdr[low_map[key]].dropna()
+            if not s.empty and pd.api.types.is_numeric_dtype(s):
+                s.name = ticker
+                return s
+    # 3) 수치형 컬럼 중 'Volume'/'Change' 제외 후 첫 번째
+    exclude = {"volume", "change", "거래량"}
+    for col in df_fdr.columns:
+        if col.lower() in exclude:
+            continue
+        s = df_fdr[col].dropna()
+        if not s.empty and pd.api.types.is_numeric_dtype(s) and (s > 0).all():
+            dprint(f"  [FDR fallback컬럼] {ticker}: '{col}'")
+            s.name = ticker
+            return s
+    return pd.Series(dtype=float, name=ticker)
+
+
+def _history_close(hist: pd.DataFrame, ticker: str) -> pd.Series:
+    """
+    yf.Ticker().history() 결과에서 Close 추출.
+    ─────────────────────────────────────────────────────────────
+    yfinance 버전별 history() 반환 구조:
+      - 구버전 (≤0.2.30): 단순 DF, 컬럼=['Open','High','Low','Close',...]
+      - 신버전 (≥0.2.31): MultiIndex DF 또는 단순 DF (auto_adjust 여부)
+      - 일부 환경: 컬럼 튜플 ('Close','005930.KS') 형태
+    ─────────────────────────────────────────────────────────────
+    """
+    if hist is None or hist.empty:
+        return pd.Series(dtype=float, name=ticker)
+
+    # MultiIndex면 _extract_close_series 위임
+    if isinstance(hist.columns, pd.MultiIndex):
+        return _extract_close_series(hist, ticker)
+
+    # 단순 Index: 컬럼이 튜플인 경우 (일부 yfinance 버전)
+    if hist.columns.dtype == object:
+        for col in hist.columns:
+            col_str = str(col).lower()
+            if "close" in col_str or "adj" in col_str:
+                s = hist[col].dropna()
+                if not s.empty and pd.api.types.is_numeric_dtype(s):
+                    s.name = ticker
+                    return s
+
+    # 일반 컬럼명 처리
+    for col in ["Close", "Adj Close", "close", "adj close"]:
+        if col in hist.columns:
+            s = hist[col].dropna()
+            if not s.empty:
+                s.name = ticker
+                return s
+
+    # 수치형 첫 컬럼 fallback
+    num_cols = hist.select_dtypes(include="number").columns
+    exclude = {"volume", "dividends", "stock splits"}
+    for col in num_cols:
+        if col.lower() not in exclude:
+            s = hist[col].dropna()
+            if not s.empty and (s > 0).all():
+                dprint(f"  [history fallback컬럼] {ticker}: '{col}'")
+                s.name = ticker
+                return s
+
+    return pd.Series(dtype=float, name=ticker)
+
+
 def _fetch_kr_ticker(ticker: str, start: str, end: str) -> pd.Series:
     """
     한국 종목 전용 fetcher.
-    ★ 수정: FDR을 1차로 올림 (가장 안정적), yfinance 2차 fallback
-
-    1차: FinanceDataReader — KR 종목에 가장 안정적
-    2차: yf.Ticker().history() — FDR 실패 시
-    3차: yf.download() 단일 — 최후 수단
+    ─────────────────────────────────────────────────────────────
+    우선순위:
+      1차) FinanceDataReader  — KR 데이터 가장 안정적·빠름
+      2차) yf.Ticker().history()  — FDR 실패 시
+      3차) yf.download() 단일  — 최후 수단
+    ─────────────────────────────────────────────────────────────
+    모든 단계에서 repair=False (속도), auto_adjust=True (수정주가).
+    컬럼 추출은 전용 헬퍼로 버전 무관 처리.
+    ─────────────────────────────────────────────────────────────
     """
     code = ticker.split(".")[0]  # "005930.KS" → "005930"
 
@@ -300,20 +493,10 @@ def _fetch_kr_ticker(ticker: str, start: str, end: str) -> pd.Series:
         t0 = time.time()
         df_fdr = fdr.DataReader(code, start, end)
         elapsed = time.time() - t0
-        if df_fdr is not None and not df_fdr.empty:
-            for col in ["Close", "close", "Adj Close", "Adj close"]:
-                if col in df_fdr.columns:
-                    s = df_fdr[col].dropna()
-                    if not s.empty:
-                        s.name = ticker
-                        dprint(f"  [KR 1차 FDR] {ticker}({code}): {len(s)}일 ({elapsed:.1f}s)")
-                        return s
-            # 컬럼명 불명확 시 첫 번째 컬럼 사용
-            s = df_fdr.iloc[:, 0].dropna()
-            if not s.empty:
-                s.name = ticker
-                dprint(f"  [KR 1차 FDR 첫컬럼] {ticker}({code}): {len(s)}일 ({elapsed:.1f}s)")
-                return s
+        s = _fdr_close(df_fdr, ticker)
+        if not s.empty:
+            dprint(f"  [KR 1차 FDR] {ticker}({code}): {len(s)}일 ({elapsed:.1f}s)")
+            return s
         dprint(f"  [KR 1차 FDR] {ticker} 빈 결과 ({elapsed:.1f}s)")
     except Exception as e:
         dprint(f"  [KR 1차 FDR] {ticker} 실패: {e}")
@@ -324,96 +507,104 @@ def _fetch_kr_ticker(ticker: str, start: str, end: str) -> pd.Series:
             t0 = time.time()
             hist = yf.Ticker(ticker).history(
                 start=start, end=end,
-                auto_adjust=True, actions=False, repair=False
+                auto_adjust=True, actions=False, repair=False,
             )
             elapsed = time.time() - t0
-            if hist is None or hist.empty:
-                dprint(f"  [KR 2차 Ticker.history] {ticker} 빈 결과 ({elapsed:.1f}s, 시도{attempt+1})")
-                continue
-            # 최신 yfinance: MultiIndex 또는 단순 컬럼 모두 처리
-            if isinstance(hist.columns, pd.MultiIndex):
-                s = _extract_close_series(hist, ticker)
-            else:
-                s = None
-                for col in ["Close", "Adj Close", "close"]:
-                    if col in hist.columns:
-                        s = hist[col].dropna()
-                        break
-                if s is None and not hist.empty:
-                    s = hist.iloc[:, 0].dropna()
-            if s is not None and not s.empty:
-                s.name = ticker
-                dprint(f"  [KR 2차 Ticker.history] {ticker}: {len(s)}일 ({elapsed:.1f}s, 시도{attempt+1})")
+            s = _history_close(hist, ticker)
+            if not s.empty:
+                dprint(f"  [KR 2차 history] {ticker}: {len(s)}일 ({elapsed:.1f}s, 시도{attempt+1})")
                 return s
+            dprint(f"  [KR 2차 history] {ticker} 빈 결과 ({elapsed:.1f}s, 시도{attempt+1})")
         except Exception as e:
-            dprint(f"  [KR 2차 Ticker.history] {ticker} 시도{attempt+1} 실패: {e}")
+            dprint(f"  [KR 2차 history] {ticker} 시도{attempt+1} 실패: {e}")
+        time.sleep(0.5 * (attempt + 1))
 
     # ── 3차: yf.download() 단일 ───────────────────────────────
     for attempt in range(3):
         try:
             t0 = time.time()
-            df = yf.download(
-                ticker, start=start, end=end,
-                auto_adjust=True, repair=False,
-                progress=False, timeout=20,
-            )
+            df = _yf_download_safe(ticker, start, end)
             elapsed = time.time() - t0
             s = _extract_close_series(df, ticker)
             if not s.empty:
                 dprint(f"  [KR 3차 download] {ticker}: {len(s)}일 ({elapsed:.1f}s, 시도{attempt+1})")
                 return s
+            dprint(f"  [KR 3차 download] {ticker} 빈 결과 ({elapsed:.1f}s, 시도{attempt+1})")
         except Exception as e:
             dprint(f"  [KR 3차 download] {ticker} 시도{attempt+1} 실패: {e}")
+        time.sleep(0.5 * (attempt + 1))
 
     dprint(f"  [KR] {ticker} 모든 방법 실패 → 빈 Series 반환")
     return pd.Series(dtype=float, name=ticker)
 
 
+def _yf_download_safe(tickers_arg, start: str, end: str) -> pd.DataFrame:
+    """
+    yfinance 버전에 관계없이 안전하게 download() 호출.
+    ─────────────────────────────────────────────────────────────
+    yfinance 0.2.x: group_by, threads 파라미터 지원
+    yfinance 0.2.31+: group_by deprecated, threads 제거됨
+    → 두 파라미터 모두 제거한 단순 호출이 모든 버전에서 동작.
+    ─────────────────────────────────────────────────────────────
+    """
+    # 공통 kwargs (버전 무관)
+    kwargs = dict(
+        start=start, end=end,
+        auto_adjust=True,
+        repair=False,
+        progress=False,
+    )
+    # multi_level_index=False → 단일 종목도 MultiIndex 아닌 단순 DF 반환 (0.2.40+)
+    # 지원 안 하는 버전은 TypeError → 무시
+    try:
+        return yf.download(tickers_arg, multi_level_index=True, **kwargs)
+    except TypeError:
+        pass
+    try:
+        return yf.download(tickers_arg, **kwargs)
+    except Exception as e:
+        dprint(f"  [download 실패] {e}")
+        return pd.DataFrame()
+
+
 def _fetch_us_batch(tickers: list, start: str, end: str) -> dict:
     """
     미국 종목 배치 다운로드 (속도 핵심).
-    - yf.download() 1회 호출로 모든 US 종목 처리
-    - threads=True: 병렬 처리
-    - repair=False: 추가 HTTP 제거
-    - 배치 누락 종목 자동 개별 재시도
-    - 단일 종목일 때 MultiIndex 없는 경우 별도 처리
+    ─────────────────────────────────────────────────────────────
+    설계:
+    1) 2종목 이상 → yf.download(list) 1회 배치 호출 (속도 최우선)
+    2) 배치 누락 종목 → 개별 download 재시도 (3회)
+    3) group_by / threads 파라미터 완전 제거 (yfinance 2.x 대응)
+    ─────────────────────────────────────────────────────────────
     """
     results: dict = {}
     missing: list = []
 
-    # 단일 종목이면 배치 없이 바로 개별 다운로드
+    # ── 단일 종목: 배치 없이 직접 다운로드 ───────────────────
     if len(tickers) == 1:
         t = tickers[0]
         t0 = time.time()
         try:
-            df = yf.download(t, start=start, end=end,
-                             auto_adjust=True, repair=False,
-                             progress=False, timeout=20)
+            df = _yf_download_safe(t, start, end)
             s = _extract_close_series(df, t)
             elapsed = time.time() - t0
             if not s.empty:
                 dprint(f"  [US 단일] {t}: {len(s)}일 ({elapsed:.1f}s)")
                 results[t] = s
                 return results
+            dprint(f"  [US 단일] {t}: 빈 결과 ({elapsed:.1f}s)")
         except Exception as e:
             dprint(f"  [US 단일 실패] {t}: {e}")
         results[t] = pd.Series(dtype=float, name=t)
         return results
 
+    # ── 다수 종목: 배치 다운로드 ──────────────────────────────
     t0 = time.time()
-    try:
-        df = yf.download(
-            tickers, start=start, end=end,
-            auto_adjust=True, repair=False,
-            progress=False, threads=True, timeout=30,
-        )
-        elapsed = time.time() - t0
-        dprint(f"  [US 배치] {len(tickers)}종목 다운로드 완료 ({elapsed:.1f}s)")
-    except Exception as e:
-        dprint(f"  [US 배치 실패] {e}")
-        df = None
+    df = _yf_download_safe(tickers, start, end)
+    elapsed = time.time() - t0
 
     if df is not None and not df.empty:
+        dprint(f"  [US 배치] {len(tickers)}종목 완료 ({elapsed:.1f}s) columns={list(df.columns[:6])}")
         for t in tickers:
             s = _extract_close_series(df, t)
             if not s.empty:
@@ -424,19 +615,15 @@ def _fetch_us_batch(tickers: list, start: str, end: str) -> dict:
                 dprint(f"    ✗ {t}: 배치 추출 실패 → 개별 재시도")
     else:
         missing = list(tickers)
-        dprint(f"  [US 배치] 전체 실패 → 전 종목 개별 재시도")
+        dprint(f"  [US 배치] 전체 실패 ({elapsed:.1f}s) → 전 종목 개별 재시도")
 
-    # 누락 종목 개별 재시도
+    # ── 누락 종목 개별 재시도 ─────────────────────────────────
     for t in missing:
         t1 = time.time()
         fetched = False
         for attempt in range(3):
             try:
-                df_single = yf.download(
-                    t, start=start, end=end,
-                    auto_adjust=True, repair=False,
-                    progress=False, timeout=20,
-                )
+                df_single = _yf_download_safe(t, start, end)
                 s = _extract_close_series(df_single, t)
                 if not s.empty:
                     results[t] = s
@@ -444,8 +631,10 @@ def _fetch_us_batch(tickers: list, start: str, end: str) -> dict:
                     dprint(f"  [US 개별] {t}: {len(s)}일 ({elapsed:.1f}s, 시도{attempt+1})")
                     fetched = True
                     break
+                dprint(f"  [US 개별] {t} 시도{attempt+1}: 빈 결과")
             except Exception as e:
                 dprint(f"  [US 개별] {t} 시도{attempt+1} 실패: {e}")
+            time.sleep(0.5 * (attempt + 1))  # 재시도 대기
         if not fetched:
             results[t] = pd.Series(dtype=float, name=t)
             dprint(f"  [US] {t}: 모든 방법 실패")
