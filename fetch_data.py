@@ -1,21 +1,20 @@
 # ============================================================
-# 퀀트 백테스팅 대시보드 v4 (버그픽스: 삼성전자/애플 데이터 누락 해결)
-# 수정사항:
-#   1. 달력 클릭 UI (JS date picker)
-#   2. 설명 문구 제거
-#   3. 거치식/적립식 수익률 계산 로직 완전 재작성 (정확도)
-#   4. 재실행 버그 완전 수정 (포트 충돌, Plot 누적 등)
-#   5. [속도 개선]
-#      - yf.download() 배치 다운로드 (1회 요청으로 전 종목)
-#      - repair=False (불필요한 추가 요청 제거)
-#      - 메모리 캐시 (동일 종목·기간 재요청 즉시 반환)
-#   6. [버그픽스 - 핵심]
-#      - _safe_tz_strip(): tz-aware 인덱스에 tz_localize(None) 호출 → TypeError 수정
-#        (yfinance는 UTC aware 인덱스를 반환 → tz_convert("UTC").tz_localize(None) 처리)
-#      - _extract_close_series(): MultiIndex 컬럼 순서(Price×Ticker vs Ticker×Price)
-#        모두 대응, 대소문자 무시 매칭 추가
-#      - _per_ticker_fallback(): 배치에서 누락된 종목 자동 개별 재시도
-#        (삼성전자, 애플 등 배치 누락 시에도 정상 데이터 반환)
+# 퀀트 백테스팅 대시보드 v5
+# ─────────────────────────────────────────────────────────────
+# 버그픽스 (v3→v5):
+#   [핵심 1] _extract_close_series 완전 재작성
+#            - 최신 yfinance(0.2.50+) MultiIndex(Price,Ticker) 구조 대응
+#            - 컬럼 인덱스 직접 순회 방식으로 xs() 의존 제거
+#            - KR 티커(005930.KS 등) MultiIndex 에서도 정확히 추출
+#   [핵심 2] _fetch_kr_ticker 수정
+#            - yf.Ticker().history() 반환값이 MultiIndex인 경우도 처리
+#            - "Close" in hist.columns → _extract_close_series() 사용으로 교체
+#   [핵심 3] _fetch_us_batch 수정
+#            - 단일 ticker 개별 재시도 시에도 _extract_close_series() 일관 적용
+#   [속도 유지]
+#            - yf.download() 배치 (threads=True, repair=False)
+#            - 인메모리 캐시 (_PRICE_CACHE)
+#            - 미국/한국 분리 전략 유지
 # ============================================================
 
 # ── 패키지 설치 ─────────────────────────────────────────────
@@ -37,6 +36,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, date
 import threading
+import time
 
 # ── 한글 종목명 사전 ─────────────────────────────────────────
 BASE_NAME_TO_TICKER = {
@@ -52,12 +52,13 @@ BASE_NAME_TO_TICKER = {
     "우버": "UBER", "팔란티어": "PLTR", "스노우플레이크": "SNOW",
     "세일즈포스": "CRM", "쇼피파이": "SHOP", "스포티파이": "SPOT",
     "에어비앤비": "ABNB", "코인베이스": "COIN", "로블록스": "RBLX",
-    "아이온큐": "IONQ", "리게티": "RGTI", "ARM": "ARM",
+    "아이온큐": "IONQ", "리게티": "RGTI", "ARM홀딩스": "ARM",
     "소파이": "SOFI", "로빈후드": "HOOD",
     "버크셔": "BRK-B", "JP모건": "JPM", "뱅크오브아메리카": "BAC",
     "골드만삭스": "GS", "비자": "V", "마스터카드": "MA",
     "존슨앤존슨": "JNJ", "화이자": "PFE", "머크": "MRK",
-    "엑슨모빌": "XOM", "쉐브론": "CVX", "ASML": "ASML", "TSMC": "TSM",
+    "엑슨모빌": "XOM", "쉐브론": "CVX",
+    "ASML": "ASML", "TSMC": "TSM", "ARM": "ARM",
     # ETF
     "나스닥": "QQQ", "나스닥1배": "QQQ", "나스닥2배": "QLD",
     "나스닥3배": "TQQQ", "나스닥인버스": "SQQQ",
@@ -123,7 +124,12 @@ def load_krx_map() -> dict:
             _KRX_MAP = {}
     return _KRX_MAP
 
+
 def resolve_ticker(raw: str) -> str:
+    """
+    한글명 / 종목코드 / 영문티커 → yfinance 티커로 변환.
+    우선순위: 내장 사전 → KRX 동적 사전 → 숫자 6자리 → 대문자 그대로
+    """
     t = raw.strip().replace(" ", "")
     t_upper = t.upper()
     # 1) 내장 사전 (한글 포함)
@@ -143,205 +149,294 @@ def resolve_ticker(raw: str) -> str:
     # 4) 원본 대문자 반환
     return t_upper
 
-# ============================================================
-# 속도 개선: 메모리 캐시 + yf.download() 배치 방식
-# ============================================================
 
-# 캐시 구조: { (tuple(sorted_tickers), start, end) : {ticker: pd.Series} }
+# ============================================================
+# ★ 핵심 수정: _extract_close_series (v5 완전 재작성)
+# ─────────────────────────────────────────────────────────────
+# 문제: 기존 xs() 기반 방식이 최신 yfinance(0.2.50+)에서
+#       MultiIndex 구조 변화로 인해 KR/US 모두 추출 실패
+# 해결: 컬럼 인덱스를 직접 순회하여 (Price,Ticker) / (Ticker,Price)
+#       두 가지 레이아웃 모두 안전하게 처리
+# ============================================================
+def _extract_close_series(df: pd.DataFrame, ticker: str) -> pd.Series:
+    """
+    yfinance DataFrame에서 Close 시리즈 추출.
+    - flat DataFrame (단일 ticker / 구버전)
+    - MultiIndex (Price, Ticker) → 최신 yfinance 기본
+    - MultiIndex (Ticker, Price) → 구버전 yfinance
+    모두 대응. xs() 사용 금지 (버전별 불안정).
+    """
+    if df is None or df.empty:
+        return pd.Series(dtype=float, name=ticker)
+
+    try:
+        # ── Flat DataFrame ────────────────────────────────────
+        if not isinstance(df.columns, pd.MultiIndex):
+            cols_low = {str(c).lower(): str(c) for c in df.columns}
+            for key in ["close", "adj close"]:
+                if key in cols_low:
+                    return df[cols_low[key]].dropna().rename(ticker)
+            # 숫자 컬럼 첫 번째
+            num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+            if num_cols:
+                return df[num_cols[0]].dropna().rename(ticker)
+            return pd.Series(dtype=float, name=ticker)
+
+        # ── MultiIndex: 컬럼 직접 순회 ────────────────────────
+        lvl0 = [str(x) for x in df.columns.get_level_values(0)]
+        lvl1 = [str(x) for x in df.columns.get_level_values(1)]
+        lvl0_low = [x.lower() for x in lvl0]
+        lvl1_low = [x.lower() for x in lvl1]
+        lvl0_up  = [x.upper() for x in lvl0]
+        lvl1_up  = [x.upper() for x in lvl1]
+        ticker_up = ticker.upper()
+
+        # Case A: (Price, Ticker) → level0=Price명, level1=Ticker명
+        # 최신 yfinance 기본 레이아웃
+        if any(x in lvl0_low for x in ["close", "adj close"]):
+            for price_key in ["close", "adj close"]:
+                for col_idx, (p, t_col) in enumerate(zip(lvl0_low, lvl1_up)):
+                    if p == price_key and t_col == ticker_up:
+                        return df.iloc[:, col_idx].dropna().rename(ticker)
+
+        # Case B: (Ticker, Price) → level0=Ticker명, level1=Price명
+        if ticker_up in lvl0_up:
+            for price_key in ["close", "adj close"]:
+                for col_idx, (t_col, p) in enumerate(zip(lvl0_up, lvl1_low)):
+                    if t_col == ticker_up and p == price_key:
+                        return df.iloc[:, col_idx].dropna().rename(ticker)
+            # price 컬럼 못 찾으면 해당 ticker의 첫 컬럼
+            for col_idx, t_col in enumerate(lvl0_up):
+                if t_col == ticker_up:
+                    return df.iloc[:, col_idx].dropna().rename(ticker)
+
+        # Case C: level1에 Price, level0에 Ticker (드문 경우)
+        if ticker_up in lvl1_up:
+            for price_key in ["close", "adj close"]:
+                for col_idx, (t_col, p) in enumerate(zip(lvl1_up, lvl0_low)):
+                    if t_col == ticker_up and p == price_key:
+                        return df.iloc[:, col_idx].dropna().rename(ticker)
+
+    except Exception as e:
+        print(f"  [추출 오류] {ticker}: {e}")
+
+    return pd.Series(dtype=float, name=ticker)
+
+
+# ============================================================
+# 데이터 다운로드: 캐시 + 미국 배치 / 한국 개별 분리 전략
+# ============================================================
 _PRICE_CACHE: dict = {}
-_cache_lock = threading.Lock()
+_cache_lock  = threading.Lock()
+
 
 def _cache_key(tickers: list, start: str, end: str) -> tuple:
     return (tuple(sorted(tickers)), start, end)
 
+
 def _safe_tz_strip(idx: pd.DatetimeIndex) -> pd.DatetimeIndex:
-    """
-    timezone-aware / naive 어느 쪽이든 안전하게 tz-naive UTC로 변환.
-    - tz 있으면 tz_convert("UTC").tz_localize(None)
-    - tz 없으면 그대로
-    """
+    """tz-aware/naive 상관없이 tz-naive로 변환."""
     idx = pd.to_datetime(idx)
     if idx.tz is not None:
         return idx.tz_convert("UTC").tz_localize(None)
     return idx
 
 
-def _extract_close_series(df: pd.DataFrame, ticker: str) -> pd.Series:
+# ─────────────────────────────────────────────────────────────
+# ★ 핵심 수정: _fetch_kr_ticker (v5)
+# 문제: yf.Ticker().history() 반환값이 최신 yfinance에서
+#       MultiIndex DataFrame이거나 "Close" 컬럼 구조가 달라
+#       "Close" in hist.columns 조건이 False가 되어 항상 실패
+# 해결: _extract_close_series()로 일관되게 추출
+# ─────────────────────────────────────────────────────────────
+def _fetch_kr_ticker(ticker: str, start: str, end: str) -> pd.Series:
     """
-    yfinance 반환 DataFrame에서 단일 ticker의 Close 시리즈를 안전하게 추출.
-    MultiIndex / 단일 Index / 컬럼 순서 등 모든 케이스 대응.
+    한국 종목 전용 fetcher.
+    1차: yf.Ticker().history()  — _extract_close_series()로 추출 (버그픽스)
+    2차: yf.download() 단일
+    3차: FinanceDataReader fallback
+    각 단계 최대 2회 재시도.
     """
-    if df is None or df.empty:
-        return pd.Series(dtype=float, name=ticker)
+    code = ticker.split(".")[0]  # "005930.KS" → "005930"
 
+    # ── 1차: Ticker.history() ─────────────────────────────────
+    for attempt in range(2):
+        try:
+            hist = yf.Ticker(ticker).history(
+                start=start, end=end,
+                auto_adjust=True, actions=False,
+                timeout=20,
+            )
+            if hist is not None and not hist.empty:
+                # ★ v5 핵심 수정: _extract_close_series() 사용
+                s = _extract_close_series(hist, ticker)
+                if s.empty:
+                    # flat DataFrame에서 Close 직접 시도
+                    if "Close" in hist.columns:
+                        s = hist["Close"].dropna().rename(ticker)
+                if not s.empty:
+                    print(f"  [KR Ticker.history] {ticker} 성공 ({len(s)}일, 시도{attempt+1})")
+                    return s
+        except Exception as e:
+            print(f"  [KR Ticker.history] {ticker} 시도{attempt+1} 실패: {e}")
+
+    # ── 2차: yf.download() 단일 ──────────────────────────────
+    for attempt in range(2):
+        try:
+            df = yf.download(
+                ticker, start=start, end=end,
+                auto_adjust=True, repair=False,
+                progress=False, timeout=25,
+            )
+            s = _extract_close_series(df, ticker)
+            if not s.empty:
+                print(f"  [KR download] {ticker} 성공 ({len(s)}일, 시도{attempt+1})")
+                return s
+        except Exception as e:
+            print(f"  [KR download] {ticker} 시도{attempt+1} 실패: {e}")
+
+    # ── 3차: FinanceDataReader fallback ──────────────────────
     try:
-        if isinstance(df.columns, pd.MultiIndex):
-            lvl0 = df.columns.get_level_values(0).str.lower().tolist()
-            lvl1 = df.columns.get_level_values(1).tolist()
-
-            # Case A: (Price, Ticker) 순서 — 최신 yfinance 기본
-            if "close" in lvl0:
-                sub = df.xs("Close", axis=1, level=0, drop_level=True)
-                if ticker in sub.columns:
-                    return sub[ticker].dropna()
-                # ticker 대소문자 무시 매칭
-                col_map = {c.upper(): c for c in sub.columns}
-                if ticker.upper() in col_map:
-                    return sub[col_map[ticker.upper()]].dropna()
-
-            # Case B: (Ticker, Price) 순서
-            if ticker in lvl0 or ticker.upper() in [x.upper() for x in lvl0]:
-                try:
-                    sub = df.xs(ticker, axis=1, level=0, drop_level=True)
-                    if "Close" in sub.columns:
-                        return sub["Close"].dropna()
-                    return sub.iloc[:, 0].dropna()
-                except KeyError:
-                    pass
-
-            # Case C: "close" in lvl1 → (Ticker, Price) 순서로 level 바뀐 경우
-            if "close" in [x.lower() for x in lvl1]:
-                sub = df.xs("Close", axis=1, level=1, drop_level=True)
-                if ticker in sub.columns:
-                    return sub[ticker].dropna()
-                col_map = {c.upper(): c for c in sub.columns}
-                if ticker.upper() in col_map:
-                    return sub[col_map[ticker.upper()]].dropna()
-
-        else:
-            # 단일 Index DataFrame
-            if "Close" in df.columns:
-                return df["Close"].dropna()
-            # 대소문자 무시
-            col_lower = {c.lower(): c for c in df.columns}
-            if "close" in col_lower:
-                return df[col_lower["close"]].dropna()
-            return df.iloc[:, 0].dropna()
-
+        import FinanceDataReader as fdr
+        df_fdr = fdr.DataReader(code, start, end)
+        if df_fdr is not None and not df_fdr.empty:
+            cols_low = {str(c).lower(): str(c) for c in df_fdr.columns}
+            for key in ["close", "adj close"]:
+                if key in cols_low:
+                    s = df_fdr[cols_low[key]].dropna().rename(ticker)
+                    print(f"  [KR FDR] {ticker} 성공 ({len(s)}일)")
+                    return s
     except Exception as e:
-        print(f"[추출 오류] {ticker}: {e}")
+        print(f"  [KR FDR] {ticker} 실패: {e}")
 
+    print(f"  [KR] {ticker} 모든 방법 실패 → 빈 Series 반환")
     return pd.Series(dtype=float, name=ticker)
 
 
-def _per_ticker_fallback(ticker: str, start: str, end: str) -> pd.Series:
+def _fetch_us_batch(tickers: list, start: str, end: str) -> dict:
     """
-    배치 다운로드에서 누락된 종목을 1개씩 재시도.
-    repair=False 로 최대한 빠르게.
+    미국 종목 배치 다운로드.
+    배치에서 누락된 종목은 개별 재시도 (Ticker.history 포함).
     """
-    try:
-        print(f"  [fallback] {ticker} 개별 다운로드 중...")
-        df = yf.download(
-            ticker,
-            start=start,
-            end=end,
-            auto_adjust=True,
-            repair=False,
-            progress=False,
-            timeout=30,
-        )
-        s = _extract_close_series(df, ticker)
-        if s.empty:
-            # Ticker.history() 로 한 번 더 시도
-            hist = yf.Ticker(ticker).history(
-                start=start, end=end,
-                auto_adjust=True, repair=False
-            )
-            if not hist.empty and "Close" in hist.columns:
-                s = hist["Close"].dropna()
-                s.name = ticker
-        return s
-    except Exception as e:
-        print(f"  [fallback 실패] {ticker}: {e}")
-        return pd.Series(dtype=float, name=ticker)
-
-
-def _batch_download(tickers: list, start: str, end: str) -> dict:
-    """
-    yf.download() 로 전 종목을 단일 HTTP 요청으로 받아옵니다.
-    - auto_adjust=True  : 수정주가 (배당·분할 반영)
-    - repair=False      : 추가 검증 요청 제거 → 속도 향상
-    - progress=False    : tqdm 출력 억제
-
-    ★ 핵심 수정사항
-    1. _safe_tz_strip() : tz-aware/naive 상관없이 안전하게 tz 제거
-    2. _extract_close_series() : MultiIndex 컬럼 순서 차이 완전 대응
-    3. fallback : 배치에서 빈 종목은 개별 재시도
-    반환: { ticker: pd.Series(Close) }
-    """
-    import time
     t0 = time.time()
-
     results: dict = {}
     missing: list = []
 
-    # ── 1단계: 배치 다운로드 ────────────────────────────────
+    # ── 배치 다운로드 ─────────────────────────────────────────
     try:
         df = yf.download(
-            tickers,
-            start=start,
-            end=end,
-            auto_adjust=True,
-            repair=False,
-            progress=False,
-            threads=True,
-            timeout=30,
+            tickers, start=start, end=end,
+            auto_adjust=True, repair=False,
+            progress=False, threads=True, timeout=30,
         )
     except Exception as e:
-        print(f"[배치 다운로드 실패] {e} → 전 종목 개별 fallback")
+        print(f"  [US 배치 실패] {e}")
         df = None
 
-    elapsed_batch = time.time() - t0
-    print(f"[배치] {len(tickers)}종목 다운로드 완료 ({elapsed_batch:.1f}s)")
+    print(f"  [US 배치] {len(tickers)}종목 ({time.time()-t0:.1f}s)")
 
     if df is not None and not df.empty:
         for t in tickers:
             s = _extract_close_series(df, t)
-            if s.empty:
-                print(f"  [누락] {t} → fallback 예정")
-                missing.append(t)
+            if not s.empty:
+                results[t] = s
             else:
-                # ★ tz-aware/naive 모두 안전하게 처리
-                s.index = _safe_tz_strip(s.index)
-                s = s.sort_index()
-                if t.endswith(".KS") or t.endswith(".KQ"):
-                    s = s / 1500.0
-                results[t] = s.rename(t)
+                missing.append(t)
     else:
         missing = list(tickers)
 
-    # ── 2단계: fallback (누락 종목 개별 재시도) ─────────────
+    # ── 누락 종목 개별 재시도 ─────────────────────────────────
     for t in missing:
-        t1 = time.time()
-        s = _per_ticker_fallback(t, start, end)
-        if not s.empty:
-            s.index = _safe_tz_strip(s.index)
-            s = s.sort_index()
-            if t.endswith(".KS") or t.endswith(".KQ"):
-                s = s / 1500.0
-            results[t] = s.rename(t)
-            print(f"  [fallback 성공] {t} ({time.time()-t1:.1f}s, {len(s)}일)")
-        else:
-            results[t] = pd.Series(dtype=float, name=t)
-            print(f"  [fallback 실패] {t} → 데이터 없음")
+        fetched = False
+        # 1) yf.download 단일
+        for attempt in range(2):
+            try:
+                df_single = yf.download(
+                    t, start=start, end=end,
+                    auto_adjust=True, repair=False,
+                    progress=False, timeout=20,
+                )
+                s = _extract_close_series(df_single, t)
+                if not s.empty:
+                    results[t] = s
+                    print(f"  [US download 단일] {t} 성공 ({len(s)}일, 시도{attempt+1})")
+                    fetched = True
+                    break
+            except Exception as e:
+                print(f"  [US download 단일] {t} 시도{attempt+1} 실패: {e}")
 
-    print(f"[fetch 완료] 총 {time.time()-t0:.1f}s | 성공: {sum(1 for v in results.values() if not v.empty)}/{len(tickers)}")
+        # 2) yf.Ticker().history() fallback
+        if not fetched:
+            try:
+                hist = yf.Ticker(t).history(
+                    start=start, end=end,
+                    auto_adjust=True, actions=False, timeout=20,
+                )
+                if hist is not None and not hist.empty:
+                    s = _extract_close_series(hist, t)
+                    if s.empty and "Close" in hist.columns:
+                        s = hist["Close"].dropna().rename(t)
+                    if not s.empty:
+                        results[t] = s
+                        print(f"  [US Ticker.history] {t} 성공 ({len(s)}일)")
+                        fetched = True
+            except Exception as e:
+                print(f"  [US Ticker.history] {t} 실패: {e}")
+
+        if not fetched:
+            results[t] = pd.Series(dtype=float, name=t)
+            print(f"  [US] {t} 모든 방법 실패")
+
     return results
 
 
 def fetch_all(tickers: list, start: str, end: str) -> dict:
     """
-    캐시 우선 → 미캐시 종목만 배치 다운로드.
-    동일 종목·기간 재요청 시 0.1초 이하로 즉시 반환.
+    메인 fetcher: 캐시 → 미국 배치 / 한국 개별 분리 처리.
+    동일 종목·기간 재요청은 캐시에서 즉시 반환.
     """
+    t0 = time.time()
+
     key = _cache_key(tickers, start, end)
     with _cache_lock:
         if key in _PRICE_CACHE:
             print("[캐시 HIT] 즉시 반환")
             return _PRICE_CACHE[key]
 
-    # 캐시 미스 → 배치 다운로드
-    results = _batch_download(tickers, start, end)
+    # 미국 / 한국 분리
+    kr_tickers = [t for t in tickers if t.upper().endswith(".KS") or t.upper().endswith(".KQ")]
+    us_tickers = [t for t in tickers if t not in kr_tickers]
+
+    results: dict = {}
+
+    # ── 미국 배치 ─────────────────────────────────────────────
+    if us_tickers:
+        us_results = _fetch_us_batch(us_tickers, start, end)
+        for t, s in us_results.items():
+            if not s.empty:
+                s = s.copy()
+                s.index = _safe_tz_strip(s.index)
+                s = s.sort_index()
+                results[t] = s.rename(t)
+            else:
+                results[t] = s
+
+    # ── 한국 개별 ─────────────────────────────────────────────
+    for t in kr_tickers:
+        s = _fetch_kr_ticker(t, start, end)
+        if not s.empty:
+            s = s.copy()
+            s.index = _safe_tz_strip(s.index)
+            s = s.sort_index()
+            # KRW → USD 변환 (환율 1,500 고정)
+            s = s / 1500.0
+            results[t] = s.rename(t)
+        else:
+            results[t] = s
+
+    ok  = sum(1 for v in results.values() if not v.empty)
+    tot = len(tickers)
+    print(f"[fetch_all 완료] {time.time()-t0:.1f}s | 성공 {ok}/{tot} | KR={len(kr_tickers)}, US={len(us_tickers)}")
 
     with _cache_lock:
         _PRICE_CACHE[key] = results
@@ -350,68 +445,48 @@ def fetch_all(tickers: list, start: str, end: str) -> dict:
 
 
 # ============================================================
-# 백테스팅 엔진 (핵심 로직 완전 재작성)
+# 백테스팅 엔진
 # ============================================================
-#
 # [거치식]
 #   - D0(시작일)에 총 원금 전액으로 주식 매수
-#   - 보유 주수 = total_invest / P[0]  (고정)
-#   - i일 평가금  = 보유주수 × P[i]
-#   - 수익률(%)   = (평가금 / 원금 - 1) × 100
-#   ※ 이 구조가 곧 복리: 주가 상승분이 그대로 평가금에 반영됨
+#   - 보유 주수 = total_usd / P[0]  (고정)
+#   - i일 평가금 = 보유주수 × P[i]
+#   - 수익률(%) = (평가금 / 원금 - 1) × 100
 #
 # [적립식]
-#   - 매 거래일마다 (total_invest / 총 거래일수)씩 추가 매수
-#   - 누적 투입 원금 = daily_invest × (i+1)
+#   - 매 거래일마다 (total_usd / 총_거래일수)씩 추가 매수
 #   - 누적 보유 주수 = Σ (daily_invest / P[j])  for j=0..i
 #   - i일 평가금    = 누적 보유 주수 × P[i]
 #   - 수익률(%)     = (평가금 / 누적 원금 - 1) × 100
-#   ※ 각 날 투입한 금액이 해당일 종가로 주식을 사고,
-#      이후 주가 변동에 따라 복리처럼 증식됨
-#
 # ============================================================
+
 def backtest_lump_sum(adj_close: np.ndarray, total_usd: float):
     """거치식: D0에 전액 매수."""
     p0 = adj_close[0]
     if p0 <= 0:
         raise ValueError("시작가가 0 이하입니다.")
-    shares = total_usd / p0               # 매수 주수 (고정)
-    portfolio = shares * adj_close        # 매일 평가금
+    shares    = total_usd / p0
+    portfolio = shares * adj_close
     invested  = np.full(len(adj_close), total_usd)
     roi       = (portfolio / total_usd - 1.0) * 100.0
     return portfolio, invested, roi
 
 
 def backtest_dca(adj_close: np.ndarray, total_usd: float):
-    """
-    적립식(DCA): 매 거래일 동일 금액 매수.
-    daily_invest = total_usd / 총_거래일수
-    """
-    n = len(adj_close)
-    daily = total_usd / n
-
-    # 각 날 매수 주수
-    shares_per_day = daily / adj_close          # shape (n,)
-
-    # i일까지 누적 보유 주수 (cumsum)
-    cum_shares = np.cumsum(shares_per_day)      # shape (n,)
-
-    # i일 평가금
-    portfolio = cum_shares * adj_close          # shape (n,)
-
-    # 누적 투입 원금: 1일차=daily, 2일차=2*daily, ...
-    invested = daily * np.arange(1, n + 1)     # shape (n,)
-
-    roi = (portfolio / invested - 1.0) * 100.0
+    """적립식(DCA): 매 거래일 동일 금액 매수."""
+    n          = len(adj_close)
+    daily      = total_usd / n
+    cum_shares = np.cumsum(daily / adj_close)
+    portfolio  = cum_shares * adj_close
+    invested   = daily * np.arange(1, n + 1)
+    roi        = (portfolio / invested - 1.0) * 100.0
     return portfolio, invested, roi
 
 
 def run_backtest(ticker1, ticker2, ticker3,
                  krw_amount, from_date, to_date, strategy):
-    """
-    메인 백테스팅 함수.
-    매 호출마다 새 Figure를 생성하므로 재실행 버그 없음.
-    """
+    """메인 백테스팅 함수."""
+
     # ── 날짜 파싱 ─────────────────────────────────────────────
     def parse_date(val, fallback):
         if isinstance(val, datetime):
@@ -419,7 +494,6 @@ def run_backtest(ticker1, ticker2, ticker3,
         if isinstance(val, date):
             return val.strftime("%Y-%m-%d")
         s = str(val).strip()
-        # YYYY-MM-DD 형식 검증
         try:
             datetime.strptime(s[:10], "%Y-%m-%d")
             return s[:10]
@@ -434,7 +508,6 @@ def run_backtest(ticker1, ticker2, ticker3,
     start_date = parse_date(from_date, ten_ago_str)
     end_date   = parse_date(to_date,   today_str)
 
-    # 날짜 순서 보정
     if start_date >= end_date:
         return _error_fig("시작일이 종료일보다 같거나 늦습니다. 날짜를 확인하세요.")
 
@@ -455,21 +528,21 @@ def run_backtest(ticker1, ticker2, ticker3,
     total_usd = float(krw_amount) / 1500.0
     is_lump   = "거치식" in strategy
 
-    # ── 병렬 데이터 다운로드 ─────────────────────────────────
+    # ── 데이터 다운로드 ──────────────────────────────────────
     price_dict = fetch_all(tickers, start_date, end_date)
 
-    # ── Figure 생성 (★ 매 호출마다 새로 생성 → 재실행 버그 방지) ─
+    # ── Figure 생성 ──────────────────────────────────────────
     fig = go.Figure()
     first_valid_index = None
+    first_invested    = None
 
     for ticker, display_name in zip(tickers, display_names):
         series = price_dict.get(ticker, pd.Series(dtype=float))
 
         if series is None or series.empty:
-            print(f"[스킵] 데이터 없음: {ticker}")
+            print(f"[스킵] 데이터 없음: {ticker} (입력: {display_name})")
             continue
 
-        # 결측치 제거 + 인덱스 정렬
         series = series.sort_index().dropna()
         if len(series) < 2:
             print(f"[스킵] 데이터 부족: {ticker} ({len(series)}일)")
@@ -478,7 +551,6 @@ def run_backtest(ticker1, ticker2, ticker3,
         idx    = series.index
         prices = series.values.astype(float)
 
-        # ── 전략 분기 ──────────────────────────────────────────
         try:
             if is_lump:
                 portfolio, invested, roi = backtest_lump_sum(prices, total_usd)
@@ -488,19 +560,13 @@ def run_backtest(ticker1, ticker2, ticker3,
             print(f"[계산 오류] {ticker}: {e}")
             continue
 
-        # 최장 인덱스 기록 (원금선 그릴 때 사용)
         if first_valid_index is None or len(idx) > len(first_valid_index):
             first_valid_index = idx
-            first_is_lump     = is_lump
-            first_portfolio   = portfolio
             first_invested    = invested
 
         final_val = portfolio[-1]
         final_roi = roi[-1]
-        final_inv = invested[-1]
-
-        # hover용 customdata: [[roi, invested], ...]
-        custom = np.column_stack([roi, invested])
+        custom    = np.column_stack([roi, invested])
 
         fig.add_trace(go.Scatter(
             x=idx,
@@ -523,7 +589,7 @@ def run_backtest(ticker1, ticker2, ticker3,
         ))
 
     # ── 원금 기준선 ──────────────────────────────────────────
-    if first_valid_index is not None:
+    if first_valid_index is not None and first_invested is not None:
         fig.add_trace(go.Scatter(
             x=first_valid_index,
             y=first_invested,
@@ -569,7 +635,6 @@ def run_backtest(ticker1, ticker2, ticker3,
 
 
 def _error_fig(msg: str) -> go.Figure:
-    """에러 메시지용 빈 Figure."""
     fig = go.Figure()
     fig.update_layout(
         title=f"⚠️ {msg}",
@@ -584,10 +649,6 @@ def _error_fig(msg: str) -> go.Figure:
 TODAY   = datetime.today().strftime("%Y-%m-%d")
 TEN_AGO = (datetime.today().replace(year=datetime.today().year - 10)
            .strftime("%Y-%m-%d"))
-
-# ── 달력 선택 JavaScript (gr.HTML + input[type=date]) ────────
-# Gradio 자체 달력 컴포넌트(gr.DateTime)는 버전에 따라 미지원일 수 있으므로
-# HTML date picker를 직접 삽입하고, 변경 시 숨겨진 Textbox를 갱신하는 방식 사용.
 
 DATE_PICKER_HTML = """
 <style>
@@ -625,17 +686,14 @@ DATE_PICKER_HTML = """
 </div>
 """.replace("{FROM}", TEN_AGO).replace("{TODAY}", TODAY)
 
-# ── UI 구성 ──────────────────────────────────────────────────
 with gr.Blocks(theme=gr.themes.Soft(), title="퀀트 백테스팅") as dashboard:
-    gr.Markdown("## 📊 퀀트 백테스팅 대시보드")
+    gr.Markdown("## 📊 퀀트 백테스팅 대시보드 v5")
 
-    # 종목 입력
     with gr.Row():
-        t1 = gr.Textbox(label="종목 1", value="엔비디아",   placeholder="예: 엔비디아 / NVDA")
-        t2 = gr.Textbox(label="종목 2", value="삼성전자",   placeholder="예: 삼성전자 / 005930")
-        t3 = gr.Textbox(label="종목 3", value="나스닥2배",  placeholder="예: 나스닥2배 / QLD")
+        t1 = gr.Textbox(label="종목 1", value="엔비디아",  placeholder="예: 엔비디아 / NVDA / 005930")
+        t2 = gr.Textbox(label="종목 2", value="삼성전자",  placeholder="예: 삼성전자 / 삼전 / 005930")
+        t3 = gr.Textbox(label="종목 3", value="나스닥2배", placeholder="예: 나스닥2배 / QLD / TQQQ")
 
-    # 투자금액
     with gr.Row():
         krw_input = gr.Number(
             label="총 투자금액 (원화 KRW)",
@@ -643,9 +701,8 @@ with gr.Blocks(theme=gr.themes.Soft(), title="퀀트 백테스팅") as dashboard
             step=1_000_000,
         )
 
-    # 📅 투자 기간 : 달력 클릭 UI + 텍스트 직접 입력 동시 지원
     gr.Markdown("### 📅 투자 기간")
-    gr.HTML(DATE_PICKER_HTML)          # 달력 클릭 UI
+    gr.HTML(DATE_PICKER_HTML)
 
     with gr.Row():
         from_date_input = gr.Textbox(
@@ -661,7 +718,6 @@ with gr.Blocks(theme=gr.themes.Soft(), title="퀀트 백테스팅") as dashboard
             placeholder="예: 2026-06-20",
         )
 
-    # 전략 선택
     strategy_input = gr.Radio(
         choices=["거치식 (첫날 전액 투자)", "적립식 (매일 분할 투자)"],
         value="거치식 (첫날 전액 투자)",
@@ -669,37 +725,24 @@ with gr.Blocks(theme=gr.themes.Soft(), title="퀀트 백테스팅") as dashboard
     )
 
     run_btn     = gr.Button("🚀 백테스팅 실행", variant="primary", size="lg")
-
-    # ★ Plot 컴포넌트: show_label=False, container=False 로 깔끔하게
-    # ★ 매 실행마다 새 Figure 객체를 반환하므로 누적 버그 없음
     plot_output = gr.Plot(label="백테스팅 결과", show_label=False)
 
-    # ── 이벤트 연결 ──────────────────────────────────────────
     run_btn.click(
         fn=run_backtest,
-        inputs=[
-            t1, t2, t3,
-            krw_input,
-            from_date_input,
-            to_date_input,
-            strategy_input,
-        ],
+        inputs=[t1, t2, t3, krw_input, from_date_input, to_date_input, strategy_input],
         outputs=plot_output,
     )
 
 # ── KRX 백그라운드 로드 ──────────────────────────────────────
 threading.Thread(target=load_krx_map, daemon=True).start()
 
-# ── 실행 (Google Colab) ──────────────────────────────────────
-# inline=True  → 코랩 셀 내 직접 렌더
-# share=True   → 외부 공유 링크
-# server_port  → 재실행 충돌 방지: 랜덤 포트 사용
+# ── 실행 ─────────────────────────────────────────────────────
 import random
 port = random.randint(7000, 7999)
 
 dashboard.launch(
     debug=True,
     share=True,
-    server_port=port,        # ★ 매 실행마다 다른 포트 → 포트 충돌 방지
-    prevent_thread_lock=True # ★ 코랩 환경에서 셀 블로킹 방지
+    server_port=port,
+    prevent_thread_lock=True,
 )
