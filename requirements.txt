@@ -1,5 +1,4 @@
 Plaintext
-
 streamlit
 yfinance
 finance-datareader
